@@ -21,6 +21,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
 
+[dev-dependencies]
+filetime = "0.2"
+
 [profile.release]
 # 告诉编译器优化查找速度的同时尽量减小体积
 opt-level = 'z'

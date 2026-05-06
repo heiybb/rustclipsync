@@ -9,6 +9,7 @@ RustClipSync is a lightweight clipboard and file sync tool for trusted devices. 
 - Files are saved into a local `receive/` directory
 - Shared bearer token authentication
 - 10 MB payload limit
+- Relay queue defaults to 100 messages and 1 GiB of queued payload data
 - Windows clipboard support, including file paths and PNG images
 - Linux X11 clipboard support through `xclip`
 - Command-line configuration only, no config file required
@@ -51,6 +52,12 @@ Run the relay server on a VPS or a reachable host:
 
 ```bash
 rustclipsync server --auth-token YOUR_TOKEN --bind-addr 0.0.0.0:7878
+```
+
+Optional queue limits:
+
+```bash
+rustclipsync server --auth-token YOUR_TOKEN --max-queue-messages 100 --max-queue-bytes 1G
 ```
 
 Health check:

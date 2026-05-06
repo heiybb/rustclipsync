@@ -1,6 +1,6 @@
 use crate::clipboard::{ClipboardBackend, ClipboardItem, create_backend};
 use crate::config::ClientConfig;
-use crate::file_transfer::save_received_file;
+use crate::file_transfer::{cleanup_old_received_files, save_received_file};
 use crate::network::HttpRelayClient;
 use crate::protocol::{PayloadKind, PushRequest, RelayMessage};
 use crate::security::calculate_bytes_hash;
@@ -8,10 +8,13 @@ use anyhow::Result;
 use base64::Engine;
 use base64::prelude::*;
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
+
+const RECEIVE_FILE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const RECEIVE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub async fn run_client(config: ClientConfig) -> Result<()> {
     log::info!(
@@ -34,6 +37,8 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let relay = Arc::new(HttpRelayClient::new(&config));
     let recent_ids = Arc::new(Mutex::new(VecDeque::<String>::with_capacity(128)));
     let last_local_hash = Arc::new(Mutex::new(String::new()));
+    let receive_cleanup_task =
+        tokio::spawn(receive_cleanup_loop(PathBuf::from(&config.receive_dir)));
 
     let local_task = tokio::spawn(local_push_loop(
         config.clone(),
@@ -50,7 +55,26 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     ));
 
     let _ = tokio::try_join!(local_task, remote_task)?;
+    receive_cleanup_task.abort();
     Ok(())
+}
+
+async fn receive_cleanup_loop(receive_dir: PathBuf) {
+    loop {
+        match cleanup_old_received_files(&receive_dir, RECEIVE_FILE_RETENTION, SystemTime::now()) {
+            Ok(removed) if removed > 0 => {
+                log::info!(
+                    "cleaned old received files: dir={}, removed={}",
+                    receive_dir.display(),
+                    removed
+                );
+            }
+            Ok(_) => {}
+            Err(err) => log::warn!("receive cleanup failed: {:?}", err),
+        }
+
+        tokio::time::sleep(RECEIVE_CLEANUP_INTERVAL).await;
+    }
 }
 
 async fn local_push_loop(

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub fn sanitize_filename(input: &str) -> Result<String> {
     let normalized = input.replace('\\', "/");
@@ -48,6 +49,42 @@ pub fn save_received_file(receive_dir: &Path, filename: &str, bytes: &[u8]) -> R
     Ok(path)
 }
 
+pub fn cleanup_old_received_files(
+    receive_dir: &Path,
+    retention: Duration,
+    now: SystemTime,
+) -> Result<usize> {
+    if !receive_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0;
+    for entry in fs::read_dir(receive_dir)
+        .with_context(|| format!("failed to read receive dir {}", receive_dir.display()))?
+    {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+
+        if age > retention {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("failed to remove old file {}", entry.path().display()))?;
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +128,33 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"old");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_removes_only_old_regular_files() {
+        let root =
+            std::env::temp_dir().join(format!("rustclipsync-cleanup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let old_file = root.join("old.txt");
+        let fresh_file = root.join("fresh.txt");
+        let old_dir = root.join("old-dir");
+        fs::write(&old_file, b"old").unwrap();
+        fs::write(&fresh_file, b"fresh").unwrap();
+        fs::create_dir_all(&old_dir).unwrap();
+
+        let now = std::time::SystemTime::now();
+        let old_time = now - std::time::Duration::from_secs(25 * 60 * 60);
+        filetime::set_file_mtime(&old_file, filetime::FileTime::from_system_time(old_time))
+            .unwrap();
+        filetime::set_file_mtime(&old_dir, filetime::FileTime::from_system_time(old_time)).unwrap();
+
+        cleanup_old_received_files(&root, std::time::Duration::from_secs(24 * 60 * 60), now)
+            .unwrap();
+
+        assert!(!old_file.exists());
+        assert!(fresh_file.exists());
+        assert!(old_dir.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

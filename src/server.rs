@@ -34,15 +34,19 @@ struct IncomingMessage {
 
 struct MessageQueue {
     next_sequence: u64,
-    max_len: usize,
+    max_messages: usize,
+    max_bytes: usize,
+    queued_bytes: usize,
     messages: VecDeque<RelayMessage>,
 }
 
 impl MessageQueue {
-    fn new(max_len: usize) -> Self {
+    fn new(max_messages: usize, max_bytes: usize) -> Self {
         Self {
             next_sequence: 1,
-            max_len,
+            max_messages,
+            max_bytes,
+            queued_bytes: 0,
             messages: VecDeque::new(),
         }
     }
@@ -50,6 +54,8 @@ impl MessageQueue {
     fn push(&mut self, msg: IncomingMessage) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
+        let bytes_base64 = BASE64_STANDARD.encode(msg.bytes);
+        self.queued_bytes += bytes_base64.len();
         self.messages.push_back(RelayMessage {
             sequence,
             source: msg.source,
@@ -57,10 +63,14 @@ impl MessageQueue {
             kind: msg.kind,
             payload_hash: msg.payload_hash,
             filename: msg.filename,
-            bytes_base64: BASE64_STANDARD.encode(msg.bytes),
+            bytes_base64,
         });
-        while self.messages.len() > self.max_len {
-            self.messages.pop_front();
+        while self.messages.len() > 1
+            && (self.messages.len() > self.max_messages || self.queued_bytes > self.max_bytes)
+        {
+            if let Some(removed) = self.messages.pop_front() {
+                self.queued_bytes = self.queued_bytes.saturating_sub(removed.bytes_base64.len());
+            }
         }
         sequence
     }
@@ -90,7 +100,10 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     let state = AppState {
         auth_token: config.auth_token,
         max_payload_bytes: config.max_payload_bytes,
-        queue: Arc::new(Mutex::new(MessageQueue::new(1000))),
+        queue: Arc::new(Mutex::new(MessageQueue::new(
+            config.max_queue_messages,
+            config.max_queue_bytes,
+        ))),
     };
     let push_body_limit = json_body_limit(config.max_payload_bytes);
     let app = Router::new()
@@ -100,7 +113,12 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    log::info!("HTTP relay listening on {}", config.bind_addr);
+    log::info!(
+        "HTTP relay listening on {}, max_queue_messages={}, max_queue_bytes={}",
+        config.bind_addr,
+        config.max_queue_messages,
+        config.max_queue_bytes
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -178,7 +196,7 @@ mod tests {
 
     #[test]
     fn queue_assigns_sequence_and_excludes_self() {
-        let mut queue = MessageQueue::new(100);
+        let mut queue = MessageQueue::new(100, 1024);
         let msg = IncomingMessage {
             source: "client-a".to_string(),
             message_id: "m1".to_string(),
@@ -199,8 +217,53 @@ mod tests {
     }
 
     #[test]
+    fn queue_evicts_old_messages_by_message_count() {
+        let mut queue = MessageQueue::new(2, 1024);
+
+        queue.push(test_message("m1", b"one"));
+        queue.push(test_message("m2", b"two"));
+        queue.push(test_message("m3", b"three"));
+
+        let response = queue.pull("client-b", 0);
+        let ids: Vec<_> = response
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["m2", "m3"]);
+    }
+
+    #[test]
+    fn queue_evicts_old_messages_by_encoded_bytes() {
+        let mut queue = MessageQueue::new(100, 8);
+
+        queue.push(test_message("m1", b"abc"));
+        queue.push(test_message("m2", b"def"));
+        queue.push(test_message("m3", b"ghi"));
+
+        let response = queue.pull("client-b", 0);
+        let ids: Vec<_> = response
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["m2", "m3"]);
+    }
+
+    #[test]
     fn json_body_limit_allows_base64_overhead() {
         let limit = json_body_limit(10 * 1024 * 1024);
         assert!(limit > 13 * 1024 * 1024);
+    }
+
+    fn test_message(message_id: &str, bytes: &[u8]) -> IncomingMessage {
+        IncomingMessage {
+            source: "client-a".to_string(),
+            message_id: message_id.to_string(),
+            kind: PayloadKind::Text,
+            payload_hash: calculate_bytes_hash(bytes),
+            filename: None,
+            bytes: bytes.to_vec(),
+        }
     }
 }
