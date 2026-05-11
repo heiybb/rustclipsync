@@ -43,7 +43,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
         config.receive_dir,
         config.poll_interval_ms,
         INLINE_PAYLOAD_LIMIT_BYTES,
-        R2_PAYLOAD_LIMIT_BYTES
+        config.max_payload_bytes
     );
 
     let backend = Arc::new(Mutex::new(create_backend()?));
@@ -337,6 +337,7 @@ async fn bytes_from_message(relay: &CloudflareRelay, message: &RelayMessage) -> 
     }
 }
 
+#[cfg(test)]
 fn bytes_from_inline_message(message: &RelayMessage) -> Result<Option<Vec<u8>>> {
     match &message.payload {
         RelayPayload::Inline { bytes_base64 } => {

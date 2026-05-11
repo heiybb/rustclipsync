@@ -29,7 +29,10 @@ where
         bail!("{}", usage());
     }
 
-    if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-h" | "--help" | "help")
+    ) {
         bail!("{}", usage());
     }
 

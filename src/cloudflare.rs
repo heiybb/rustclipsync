@@ -25,7 +25,10 @@ impl CloudflareRelay {
     pub async fn connect(
         &self,
         last_seen_sequence: u64,
-    ) -> Result<(mpsc::Sender<ClientWsMessage>, mpsc::Receiver<ServerWsMessage>)> {
+    ) -> Result<(
+        mpsc::Sender<ClientWsMessage>,
+        mpsc::Receiver<ServerWsMessage>,
+    )> {
         let mut request = ws_endpoint(&self.config.server_url)?.into_client_request()?;
         request.headers_mut().insert(
             AUTHORIZATION,
