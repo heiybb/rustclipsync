@@ -120,12 +120,13 @@ async fn remote_pull_loop(
     last_local_hash: Arc<Mutex<String>>,
 ) -> Result<()> {
     let mut last_seen_sequence = 0;
+    let mut is_initial_pull = true;
 
     loop {
         match relay.pull(&config.client_id, last_seen_sequence).await {
             Ok(response) => {
                 last_seen_sequence = response.latest_sequence;
-                for message in response.messages {
+                for message in messages_for_pull(is_initial_pull, response.messages) {
                     let mut backend = backend.lock().unwrap();
                     apply_remote_message(
                         &config,
@@ -135,6 +136,7 @@ async fn remote_pull_loop(
                         &last_local_hash,
                     )?;
                 }
+                is_initial_pull = false;
             }
             Err(err) => log::warn!("pull failed: {:?}", err),
         }
@@ -256,6 +258,14 @@ fn apply_remote_message(
     Ok(())
 }
 
+fn messages_for_pull(is_initial_pull: bool, messages: Vec<RelayMessage>) -> Vec<RelayMessage> {
+    if is_initial_pull {
+        messages.into_iter().next_back().into_iter().collect()
+    } else {
+        messages
+    }
+}
+
 fn hash_prefix(hash: &str) -> &str {
     hash.get(..8).unwrap_or(hash)
 }
@@ -301,6 +311,32 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn initial_pull_applies_only_latest_remote_message() {
+        let messages = vec![
+            test_relay_message(1, "m1"),
+            test_relay_message(2, "m2"),
+            test_relay_message(3, "m3"),
+        ];
+
+        let selected = messages_for_pull(true, messages);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].sequence, 3);
+        assert_eq!(selected[0].message_id, "m3");
+    }
+
+    #[test]
+    fn incremental_pull_applies_all_remote_messages() {
+        let messages = vec![test_relay_message(4, "m4"), test_relay_message(5, "m5")];
+
+        let selected = messages_for_pull(false, messages);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].sequence, 4);
+        assert_eq!(selected[1].sequence, 5);
+    }
+
     fn test_config() -> ClientConfig {
         ClientConfig {
             server_url: "http://127.0.0.1:7878".to_string(),
@@ -311,6 +347,18 @@ mod tests {
             remote_poll_interval_ms: 500,
             receive_dir: "receive".to_string(),
             max_payload_bytes: 10 * 1024 * 1024,
+        }
+    }
+
+    fn test_relay_message(sequence: u64, message_id: &str) -> RelayMessage {
+        RelayMessage {
+            sequence,
+            source: "client-b".to_string(),
+            message_id: message_id.to_string(),
+            kind: PayloadKind::Text,
+            payload_hash: calculate_bytes_hash(message_id.as_bytes()),
+            filename: None,
+            bytes_base64: BASE64_STANDARD.encode(message_id),
         }
     }
 }
