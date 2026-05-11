@@ -108,5 +108,8 @@ function optionalString(value: unknown): value is string | undefined {
 
 function safeSegment(value: string): string {
   const safe = value.replace(/[^A-Za-z0-9._-]/g, "_");
-  return safe.length > 0 ? safe : "unnamed";
+  if (safe.length === 0 || /^\.+$/.test(safe)) {
+    return "unnamed";
+  }
+  return safe;
 }

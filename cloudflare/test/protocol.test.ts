@@ -32,4 +32,10 @@ describe("R2 object keys", () => {
       "rooms/default/messages/message-1/sample.txt",
     );
   });
+
+  it("replaces dot-only path segments", () => {
+    expect(objectKeyFor(".", "..", "...")).toBe(
+      "rooms/unnamed/messages/unnamed/unnamed",
+    );
+  });
 });
