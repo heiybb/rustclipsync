@@ -2,7 +2,7 @@ use crate::clipboard::{ClipboardBackend, ClipboardItem, create_backend};
 use crate::config::ClientConfig;
 use crate::file_transfer::{cleanup_old_received_files, save_received_file};
 use crate::network::HttpRelayClient;
-use crate::protocol::{PayloadKind, PushRequest, RelayMessage};
+use crate::protocol::{PayloadKind, PushRequest, RelayMessage, RelayPayload};
 use crate::security::calculate_bytes_hash;
 use anyhow::Result;
 use base64::Engine;
@@ -15,6 +15,24 @@ use uuid::Uuid;
 
 const RECEIVE_FILE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECEIVE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const INLINE_PAYLOAD_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+pub const R2_PAYLOAD_LIMIT_BYTES: usize = 100 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutgoingPayloadRoute {
+    Inline,
+    R2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPayload {
+    pub message_id: String,
+    pub kind: PayloadKind,
+    pub payload_hash: String,
+    pub filename: Option<String>,
+    pub bytes: Vec<u8>,
+    pub route: OutgoingPayloadRoute,
+}
 
 pub async fn run_client(config: ClientConfig) -> Result<()> {
     log::info!(
@@ -146,6 +164,28 @@ async fn remote_pull_loop(
 }
 
 fn item_to_push_request(config: &ClientConfig, item: ClipboardItem) -> Result<Option<PushRequest>> {
+    let Some(payload) = local_payload_for_item(config, item)? else {
+        return Ok(None);
+    };
+    if payload.route != OutgoingPayloadRoute::Inline {
+        log::warn!("local payload requires R2 and cannot be sent through HTTP relay");
+        return Ok(None);
+    }
+
+    Ok(Some(PushRequest {
+        client_id: config.client_id.clone(),
+        message_id: payload.message_id,
+        kind: payload.kind,
+        payload_hash: payload.payload_hash,
+        filename: payload.filename,
+        bytes_base64: BASE64_STANDARD.encode(payload.bytes),
+    }))
+}
+
+pub fn local_payload_for_item(
+    _config: &ClientConfig,
+    item: ClipboardItem,
+) -> Result<Option<LocalPayload>> {
     let (kind, filename, bytes) = match item {
         ClipboardItem::Text(text) => (PayloadKind::Text, None, text.into_bytes()),
         ClipboardItem::ImagePng(bytes) => (PayloadKind::ImagePng, None, bytes),
@@ -154,8 +194,8 @@ fn item_to_push_request(config: &ClientConfig, item: ClipboardItem) -> Result<Op
                 return Ok(None);
             }
             let metadata = std::fs::metadata(&path)?;
-            if metadata.len() as usize > config.max_payload_bytes {
-                log::warn!("file ignored because it exceeds configured limit");
+            if metadata.len() > R2_PAYLOAD_LIMIT_BYTES as u64 {
+                log::warn!("file ignored because it exceeds Cloudflare R2 payload limit");
                 return Ok(None);
             }
             let bytes = std::fs::read(&path)?;
@@ -167,19 +207,25 @@ fn item_to_push_request(config: &ClientConfig, item: ClipboardItem) -> Result<Op
         }
     };
 
-    if bytes.len() > config.max_payload_bytes {
-        log::warn!("local payload ignored because it exceeds configured limit");
+    if bytes.len() > R2_PAYLOAD_LIMIT_BYTES {
+        log::warn!("local payload ignored because it exceeds Cloudflare R2 payload limit");
         return Ok(None);
     }
 
+    let route = if bytes.len() <= INLINE_PAYLOAD_LIMIT_BYTES {
+        OutgoingPayloadRoute::Inline
+    } else {
+        OutgoingPayloadRoute::R2
+    };
     let payload_hash = calculate_bytes_hash(&bytes);
-    Ok(Some(PushRequest {
-        client_id: config.client_id.clone(),
+
+    Ok(Some(LocalPayload {
         message_id: Uuid::new_v4().to_string(),
         kind,
         payload_hash,
         filename,
-        bytes_base64: BASE64_STANDARD.encode(bytes),
+        bytes,
+        route,
     }))
 }
 
@@ -275,40 +321,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_item_becomes_push_request() {
+    fn text_payload_uses_inline_route() {
         let config = test_config();
-        let request = item_to_push_request(&config, ClipboardItem::Text("hello".to_string()))
+        let payload = local_payload_for_item(&config, ClipboardItem::Text("hello".to_string()))
             .unwrap()
             .unwrap();
 
-        assert_eq!(request.client_id, "client-a");
-        assert_eq!(request.kind, PayloadKind::Text);
-        assert_eq!(
-            BASE64_STANDARD.decode(request.bytes_base64).unwrap(),
-            b"hello"
-        );
+        assert_eq!(payload.kind, PayloadKind::Text);
+        assert_eq!(payload.bytes, b"hello");
+        assert_eq!(payload.route, OutgoingPayloadRoute::Inline);
     }
 
     #[test]
-    fn file_item_becomes_push_request() {
-        let root = std::env::temp_dir().join(format!("rustclipsync-local-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let file_path = root.join("sample.txt");
-        std::fs::write(&file_path, b"hello").unwrap();
-
+    fn ten_mb_file_uses_inline_route() {
+        let (_root, file_path) = sparse_test_file(INLINE_PAYLOAD_LIMIT_BYTES as u64);
         let config = test_config();
-        let request = item_to_push_request(&config, ClipboardItem::FilePath(file_path))
+        let payload = local_payload_for_item(&config, ClipboardItem::FilePath(file_path))
             .unwrap()
             .unwrap();
 
-        assert_eq!(request.kind, PayloadKind::File);
-        assert_eq!(request.filename.as_deref(), Some("sample.txt"));
-        assert_eq!(
-            BASE64_STANDARD.decode(request.bytes_base64).unwrap(),
-            b"hello"
-        );
+        assert_eq!(payload.kind, PayloadKind::File);
+        assert_eq!(payload.filename.as_deref(), Some("sample.bin"));
+        assert_eq!(payload.bytes.len(), INLINE_PAYLOAD_LIMIT_BYTES);
+        assert_eq!(payload.route, OutgoingPayloadRoute::Inline);
+    }
 
-        std::fs::remove_dir_all(root).unwrap();
+    #[test]
+    fn file_above_ten_mb_uses_r2_route() {
+        let (_root, file_path) = sparse_test_file((INLINE_PAYLOAD_LIMIT_BYTES + 1) as u64);
+        let config = test_config();
+        let payload = local_payload_for_item(&config, ClipboardItem::FilePath(file_path))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(payload.kind, PayloadKind::File);
+        assert_eq!(payload.bytes.len(), INLINE_PAYLOAD_LIMIT_BYTES + 1);
+        assert_eq!(payload.route, OutgoingPayloadRoute::R2);
+    }
+
+    #[test]
+    fn file_above_one_hundred_mb_is_rejected() {
+        let (_root, file_path) = sparse_test_file((R2_PAYLOAD_LIMIT_BYTES + 1) as u64);
+        let config = test_config();
+        let payload = local_payload_for_item(&config, ClipboardItem::FilePath(file_path)).unwrap();
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn missing_file_path_returns_none() {
+        let config = test_config();
+        let missing_path =
+            std::env::temp_dir().join(format!("rustclipsync-missing-{}", Uuid::new_v4()));
+        let payload =
+            local_payload_for_item(&config, ClipboardItem::FilePath(missing_path)).unwrap();
+
+        assert!(payload.is_none());
     }
 
     #[test]
@@ -358,7 +426,25 @@ mod tests {
             kind: PayloadKind::Text,
             payload_hash: calculate_bytes_hash(message_id.as_bytes()),
             filename: None,
-            bytes_base64: BASE64_STANDARD.encode(message_id),
+            bytes_base64: inline_payload_bytes_base64(RelayPayload::Inline {
+                bytes_base64: BASE64_STANDARD.encode(message_id),
+            }),
         }
+    }
+
+    fn inline_payload_bytes_base64(payload: RelayPayload) -> String {
+        match payload {
+            RelayPayload::Inline { bytes_base64 } => bytes_base64,
+            RelayPayload::R2 { .. } => panic!("expected inline test payload"),
+        }
+    }
+
+    fn sparse_test_file(len: u64) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("rustclipsync-local-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file_path = root.join("sample.bin");
+        let file = std::fs::File::create(&file_path).unwrap();
+        file.set_len(len).unwrap();
+        (root, file_path)
     }
 }
