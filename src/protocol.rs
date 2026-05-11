@@ -8,13 +8,6 @@ pub enum PayloadKind {
     File,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PayloadMode {
-    Inline,
-    R2,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientWsMessage {
@@ -58,27 +51,6 @@ pub struct RelayMessage {
     pub payload_hash: String,
     pub filename: Option<String>,
     pub payload: RelayPayload,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PushRequest {
-    pub client_id: String,
-    pub message_id: String,
-    pub kind: PayloadKind,
-    pub payload_hash: String,
-    pub filename: Option<String>,
-    pub bytes_base64: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PushResponse {
-    pub sequence: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PullResponse {
-    pub latest_sequence: u64,
-    pub messages: Vec<RelayMessage>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

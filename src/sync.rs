@@ -474,9 +474,8 @@ mod tests {
             client_name: "Client A".to_string(),
             auth_token: "secret".to_string(),
             poll_interval_ms: 300,
-            remote_poll_interval_ms: 500,
             receive_dir: "receive".to_string(),
-            max_payload_bytes: 10 * 1024 * 1024,
+            max_payload_bytes: R2_PAYLOAD_LIMIT_BYTES,
         }
     }
 

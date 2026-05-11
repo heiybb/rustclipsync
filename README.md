@@ -1,30 +1,30 @@
 # RustClipSync
 
-RustClipSync is a lightweight clipboard and file sync tool for trusted devices. It uses a small HTTP relay server, so clients behind NAT or firewalls can synchronize through a VPS or any reachable host.
+RustClipSync is a lightweight clipboard and file sync tool for trusted devices. It uses a Cloudflare Worker relay with Durable Objects, WebSocket, and R2, so clients behind NAT or firewalls do not need inbound ports.
 
 ## Features
 
-- HTTP polling relay, no inbound client port required
+- WebSocket relay through Cloudflare Workers and Durable Objects
 - Text, PNG image, and file synchronization
 - Files are saved into a local `receive/` directory
 - Shared bearer token authentication
-- 10 MB payload limit
-- Relay queue defaults to 100 messages and 1 GiB of queued payload data
+- Payloads up to 10 MB are sent inline over WebSocket
+- Files larger than 10 MB and up to 100 MB are stored in R2
 - Windows clipboard support, including file paths and PNG images
 - Linux X11 clipboard support through `xclip`
 - Command-line configuration only, no config file required
 
 ## Architecture
 
-Run one relay server on a reachable machine. Every desktop runs as a client and polls the relay.
+Deploy one Cloudflare Worker relay. Every desktop connects to the Worker over WebSocket.
 
 ```text
 Windows client  ─┐
-Ubuntu X11      ─┼─ HTTP relay server ─ broadcasts to other online clients
-Other clients   ─┘
+Ubuntu X11      ─┼─ Cloudflare Worker ─ Durable Object room
+Other clients   ─┘                       └─ R2 for large files
 ```
 
-When one client detects a local clipboard change, it pushes the payload to the relay. Other clients pull new messages every 500 ms and apply them locally.
+When one client detects a local clipboard change, it publishes the payload to the Worker. Other connected clients receive the update immediately. Large files are uploaded to R2 first, then announced over WebSocket.
 
 ## Build
 
@@ -46,24 +46,26 @@ On Windows:
 target\release\rustclipsync.exe
 ```
 
-## Server
+## Cloudflare Relay
 
-Run the relay server on a VPS or a reachable host:
+Deploy the Worker in `cloudflare/` with Wrangler. The Worker uses:
 
-```bash
-rustclipsync server --auth-token YOUR_TOKEN --bind-addr 0.0.0.0:7878
-```
-
-Optional queue limits:
+- Durable Object binding `ROOM`
+- R2 bucket binding `OBJECTS`
+- Secret `AUTH_TOKEN`
 
 ```bash
-rustclipsync server --auth-token YOUR_TOKEN --max-queue-messages 100 --max-queue-bytes 1G
+cd cloudflare
+pnpm install
+pnpm wrangler r2 bucket create rustclipsync-objects
+pnpm wrangler secret put AUTH_TOKEN
+pnpm deploy
 ```
 
 Health check:
 
 ```bash
-curl http://127.0.0.1:7878/health
+curl https://YOUR_WORKER.workers.dev/health
 ```
 
 Expected response:
@@ -77,7 +79,7 @@ Expected response:
 Windows:
 
 ```powershell
-.\rustclipsync.exe client --server-url http://SERVER_IP:7878 --auth-token YOUR_TOKEN --client-id windows-client
+.\rustclipsync.exe --server-url https://YOUR_WORKER.workers.dev --auth-token YOUR_TOKEN --client-id windows-client
 ```
 
 Ubuntu X11:
@@ -85,7 +87,7 @@ Ubuntu X11:
 ```bash
 sudo apt update
 sudo apt install -y xclip
-./rustclipsync client --server-url http://SERVER_IP:7878 --auth-token YOUR_TOKEN --client-id ubuntu-x11
+./rustclipsync --server-url https://YOUR_WORKER.workers.dev --auth-token YOUR_TOKEN --client-id ubuntu-x11
 ```
 
 Use a unique `--client-id` for each machine.
@@ -98,29 +100,36 @@ PowerShell debug run:
 
 ```powershell
 $env:RUST_LOG="rustclipsync=debug,info"
-.\rustclipsync.exe client --server-url http://SERVER_IP:7878 --auth-token YOUR_TOKEN --client-id windows-client
+.\rustclipsync.exe --server-url https://YOUR_WORKER.workers.dev --auth-token YOUR_TOKEN --client-id windows-client
 ```
 
 Bash debug run:
 
 ```bash
-RUST_LOG=rustclipsync=debug,info ./rustclipsync client --server-url http://SERVER_IP:7878 --auth-token YOUR_TOKEN --client-id ubuntu-x11
+RUST_LOG=rustclipsync=debug,info ./rustclipsync --server-url https://YOUR_WORKER.workers.dev --auth-token YOUR_TOKEN --client-id ubuntu-x11
 ```
 
 ## Security Notes
 
-RustClipSync is intended for trusted devices and trusted networks.
+RustClipSync is intended for trusted devices.
 
 - Use a strong random `--auth-token`.
-- Do not expose the relay without firewall rules or a reverse proxy unless you understand the risk.
-- Plain HTTP is supported directly. For internet deployment, prefer a TLS reverse proxy, VPN, or private network overlay.
+- Store the same token as the Cloudflare Worker `AUTH_TOKEN` secret.
 - Clipboard contents may contain sensitive data. Only run clients on machines you trust.
+- R2-backed payloads are intended to be short-lived relay objects, not durable backups.
 
 ## Development
 
-Run tests and lint checks:
+Run Rust checks:
 
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
+```
+
+Run Cloudflare Worker checks:
+
+```bash
+pnpm --dir cloudflare test
+pnpm --dir cloudflare typecheck
 ```
