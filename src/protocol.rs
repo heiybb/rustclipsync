@@ -36,8 +36,8 @@ pub enum ClientWsMessage {
         payload_hash: String,
         filename: Option<String>,
         object_key: String,
-        size: u64,
-        expires_at: String,
+        size: usize,
+        expires_at: i64,
     },
 }
 
@@ -57,7 +57,7 @@ pub struct RelayMessage {
     pub kind: PayloadKind,
     pub payload_hash: String,
     pub filename: Option<String>,
-    pub bytes_base64: String,
+    pub payload: RelayPayload,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -89,8 +89,8 @@ pub enum RelayPayload {
     },
     R2 {
         object_key: String,
-        size: u64,
-        expires_at: String,
+        size: usize,
+        expires_at: i64,
     },
 }
 
@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_relay_message_preserves_inline_bytes_for_http_compatibility() {
+    fn relay_message_serializes_payload_without_legacy_bytes_field() {
         let message = RelayMessage {
             sequence: 1,
             source: "client-a".to_string(),
@@ -144,11 +144,15 @@ mod tests {
             kind: PayloadKind::Text,
             payload_hash: "hash".to_string(),
             filename: None,
-            bytes_base64: "aGVsbG8=".to_string(),
+            payload: RelayPayload::Inline {
+                bytes_base64: "aGVsbG8=".to_string(),
+            },
         };
 
         let json = serde_json::to_value(message).unwrap();
 
-        assert_eq!(json["bytes_base64"], "aGVsbG8=");
+        assert!(json.get("bytes_base64").is_none());
+        assert_eq!(json["payload"]["mode"], "inline");
+        assert_eq!(json["payload"]["bytes_base64"], "aGVsbG8=");
     }
 }

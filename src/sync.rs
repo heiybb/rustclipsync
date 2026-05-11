@@ -251,7 +251,13 @@ fn apply_remote_message(
         }
     }
 
-    let bytes = BASE64_STANDARD.decode(&message.bytes_base64)?;
+    let bytes = match &message.payload {
+        RelayPayload::Inline { bytes_base64 } => BASE64_STANDARD.decode(bytes_base64)?,
+        RelayPayload::R2 { .. } => {
+            log::warn!("remote R2 payload cannot be applied through HTTP polling client");
+            return Ok(());
+        }
+    };
     if bytes.len() > config.max_payload_bytes {
         log::warn!("remote payload exceeds configured limit");
         return Ok(());
@@ -426,16 +432,9 @@ mod tests {
             kind: PayloadKind::Text,
             payload_hash: calculate_bytes_hash(message_id.as_bytes()),
             filename: None,
-            bytes_base64: inline_payload_bytes_base64(RelayPayload::Inline {
+            payload: RelayPayload::Inline {
                 bytes_base64: BASE64_STANDARD.encode(message_id),
-            }),
-        }
-    }
-
-    fn inline_payload_bytes_base64(payload: RelayPayload) -> String {
-        match payload {
-            RelayPayload::Inline { bytes_base64 } => bytes_base64,
-            RelayPayload::R2 { .. } => panic!("expected inline test payload"),
+            },
         }
     }
 

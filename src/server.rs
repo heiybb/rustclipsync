@@ -1,5 +1,7 @@
 use crate::config::ServerConfig;
-use crate::protocol::{PayloadKind, PullResponse, PushRequest, PushResponse, RelayMessage};
+use crate::protocol::{
+    PayloadKind, PullResponse, PushRequest, PushResponse, RelayMessage, RelayPayload,
+};
 use crate::security::calculate_bytes_hash;
 use anyhow::Result;
 use axum::extract::DefaultBodyLimit;
@@ -63,13 +65,15 @@ impl MessageQueue {
             kind: msg.kind,
             payload_hash: msg.payload_hash,
             filename: msg.filename,
-            bytes_base64,
+            payload: RelayPayload::Inline { bytes_base64 },
         });
         while self.messages.len() > 1
             && (self.messages.len() > self.max_messages || self.queued_bytes > self.max_bytes)
         {
             if let Some(removed) = self.messages.pop_front() {
-                self.queued_bytes = self.queued_bytes.saturating_sub(removed.bytes_base64.len());
+                self.queued_bytes = self
+                    .queued_bytes
+                    .saturating_sub(inline_payload_size(&removed.payload));
             }
         }
         sequence
@@ -265,5 +269,12 @@ mod tests {
             filename: None,
             bytes: bytes.to_vec(),
         }
+    }
+}
+
+fn inline_payload_size(payload: &RelayPayload) -> usize {
+    match payload {
+        RelayPayload::Inline { bytes_base64 } => bytes_base64.len(),
+        RelayPayload::R2 { .. } => 0,
     }
 }
