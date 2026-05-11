@@ -1,4 +1,5 @@
 import { SyncRoom } from "./room";
+import { DEFAULT_ROOM } from "./protocol";
 import {
   getObject,
   isAuthorized,
@@ -20,6 +21,14 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
       return Response.json({ status: "ok" });
+    }
+
+    if (url.pathname === "/ws") {
+      if (!isAuthorized(request, env.AUTH_TOKEN)) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const id = env.ROOM.idFromName(DEFAULT_ROOM);
+      return env.ROOM.get(id).fetch(request);
     }
 
     const objectPath = parseObjectPath(url.pathname);
