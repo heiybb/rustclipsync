@@ -6,7 +6,7 @@ Date: 2026-05-11
 
 RustClipSync currently uses a small in-memory HTTP polling relay. Clients push clipboard payloads to `/push` and poll `/pull?client_id=&after=` for new messages. This works, but it requires running a reachable server and it adds polling latency.
 
-The new relay should run on Cloudflare serverless infrastructure while preserving the existing relay as a compatible fallback.
+The new relay should replace the polling relay with Cloudflare serverless infrastructure.
 
 Relevant Cloudflare limits checked during design:
 
@@ -18,7 +18,7 @@ Relevant Cloudflare limits checked during design:
 ## Goals
 
 - Add a Cloudflare relay using Workers, Durable Objects, WebSocket, and R2.
-- Keep the existing HTTP polling relay and CLI path usable.
+- Replace the existing HTTP polling relay and CLI server mode.
 - Use WebSocket for real-time clipboard sync.
 - Send payloads up to 10 MB directly over WebSocket.
 - Store files larger than 10 MB and up to 100 MB in R2.
@@ -28,11 +28,11 @@ Relevant Cloudflare limits checked during design:
 
 ## Non-Goals
 
-- Removing the existing Rust HTTP relay.
 - Supporting files larger than 100 MB in the first Cloudflare version.
 - Implementing multipart or presigned direct-to-R2 uploads in the first version.
 - Building a web dashboard or account management system.
 - Supporting untrusted public rooms or multi-user authorization.
+- Keeping polling transport compatibility.
 
 ## Architecture
 
@@ -62,20 +62,14 @@ The Durable Object is the authoritative coordinator for one sync room. The first
 
 R2 stores large payload bytes. The Durable Object stores only metadata for R2-backed messages.
 
-## Transport Selection
+## Transport
 
-The client gets a new transport mode:
-
-```text
---transport polling|cloudflare-ws
-```
-
-Default remains `polling` for compatibility. `cloudflare-ws` uses the same `--server-url`, `--auth-token`, and `--client-id` concepts.
+The client uses Cloudflare WebSocket transport directly. The existing polling transport and local server command are removed from the supported design.
 
 Example:
 
 ```text
-rustclipsync client --transport cloudflare-ws --server-url https://clipsync.example.com --auth-token TOKEN --client-id RYZEN
+rustclipsync client --server-url https://clipsync.example.com --auth-token TOKEN --client-id RYZEN
 ```
 
 ## Message Model
@@ -232,10 +226,11 @@ Worker and Durable Object behavior:
 Expected implementation areas:
 
 - Add a `cloudflare/` Worker project with TypeScript and Wrangler config.
-- Add Cloudflare WebSocket transport code to the Rust client.
+- Replace the Rust polling client network loop with Cloudflare WebSocket transport.
 - Add R2 upload/download client code.
 - Add protocol types for inline and R2-backed WebSocket messages.
-- Keep the current HTTP polling relay modules intact.
+- Remove Rust HTTP relay server code and polling HTTP client code that are no longer used.
+- Simplify CLI configuration by removing server mode and polling-specific settings.
 - Update README with Cloudflare deployment instructions.
 
 ## Testing
@@ -245,7 +240,8 @@ Rust tests:
 - Payload routing threshold: inline at 10 MB or below, R2 above 10 MB, reject above 100 MB.
 - WebSocket reconnect state selection.
 - R2 metadata validation and hash verification.
-- Existing polling relay tests remain passing.
+- CLI tests cover the Cloudflare-only client configuration.
+- Removed polling/server code has no compatibility test requirement.
 
 Cloudflare Worker tests:
 
@@ -266,10 +262,11 @@ Manual verification:
 
 ## Rollout
 
-1. Implement Cloudflare Worker and Durable Object in parallel with current relay.
-2. Add Rust `cloudflare-ws` transport behind explicit CLI flag.
-3. Deploy to a test Worker URL.
-4. Validate with two trusted devices.
-5. Document production deployment and rollback to `--transport polling`.
+1. Implement Cloudflare Worker and Durable Object.
+2. Replace the Rust client transport with WebSocket/R2.
+3. Remove the local Rust server mode and polling relay code.
+4. Deploy to a test Worker URL.
+5. Validate with two trusted devices.
+6. Document production deployment.
 
-Rollback is simple because the existing polling relay remains unchanged.
+Rollback is a git-level rollback to the last polling-relay commit if the new transport is not acceptable.
