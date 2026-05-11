@@ -1,16 +1,16 @@
 use crate::clipboard::{ClipboardBackend, ClipboardItem, create_backend};
+use crate::cloudflare::CloudflareRelay;
 use crate::config::ClientConfig;
 use crate::file_transfer::{cleanup_old_received_files, save_received_file};
-use crate::network::HttpRelayClient;
-use crate::protocol::{PayloadKind, PushRequest, RelayMessage, RelayPayload};
+use crate::protocol::{ClientWsMessage, PayloadKind, RelayMessage, RelayPayload, ServerWsMessage};
 use crate::security::calculate_bytes_hash;
 use anyhow::Result;
 use base64::Engine;
 use base64::prelude::*;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const RECEIVE_FILE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -36,14 +36,14 @@ pub struct LocalPayload {
 
 pub async fn run_client(config: ClientConfig) -> Result<()> {
     log::info!(
-        "client starting: id={}, name={}, relay={}, receive_dir={}, local_poll_ms={}, remote_poll_ms={}, max_payload_bytes={}",
+        "client starting: id={}, name={}, relay={}, receive_dir={}, local_poll_ms={}, max_inline_bytes={}, max_r2_bytes={}",
         config.client_id,
         config.client_name,
         config.server_url,
         config.receive_dir,
         config.poll_interval_ms,
-        config.remote_poll_interval_ms,
-        config.max_payload_bytes
+        INLINE_PAYLOAD_LIMIT_BYTES,
+        R2_PAYLOAD_LIMIT_BYTES
     );
 
     let backend = Arc::new(Mutex::new(create_backend()?));
@@ -52,29 +52,46 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
         backend.lock().unwrap().name()
     );
 
-    let relay = Arc::new(HttpRelayClient::new(&config));
-    let recent_ids = Arc::new(Mutex::new(VecDeque::<String>::with_capacity(128)));
     let last_local_hash = Arc::new(Mutex::new(String::new()));
-    let receive_cleanup_task =
+    let _receive_cleanup_task =
         tokio::spawn(receive_cleanup_loop(PathBuf::from(&config.receive_dir)));
+    let relay = Arc::new(CloudflareRelay::new(config.clone()));
+    let mut last_seen_sequence = 0;
 
-    let local_task = tokio::spawn(local_push_loop(
-        config.clone(),
-        backend.clone(),
-        relay.clone(),
-        last_local_hash.clone(),
-    ));
-    let remote_task = tokio::spawn(remote_pull_loop(
-        config,
-        backend,
-        relay,
-        recent_ids,
-        last_local_hash,
-    ));
+    loop {
+        match relay.connect(last_seen_sequence).await {
+            Ok((outgoing, incoming)) => {
+                let local_task = tokio::spawn(local_send_loop(
+                    config.clone(),
+                    backend.clone(),
+                    relay.clone(),
+                    outgoing,
+                    last_local_hash.clone(),
+                ));
+                let remote_result = remote_receive_loop(
+                    config.clone(),
+                    backend.clone(),
+                    relay.clone(),
+                    incoming,
+                    last_local_hash.clone(),
+                    &mut last_seen_sequence,
+                )
+                .await;
+                local_task.abort();
+                if let Err(err) = remote_result {
+                    log::warn!("remote receive failed: {:?}", err);
+                }
+            }
+            Err(err) => log::warn!("websocket connect failed: {:?}", err),
+        }
 
-    let _ = tokio::try_join!(local_task, remote_task)?;
-    receive_cleanup_task.abort();
-    Ok(())
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    #[allow(unreachable_code)]
+    {
+        Ok(())
+    }
 }
 
 async fn receive_cleanup_loop(receive_dir: PathBuf) {
@@ -95,10 +112,11 @@ async fn receive_cleanup_loop(receive_dir: PathBuf) {
     }
 }
 
-async fn local_push_loop(
+async fn local_send_loop(
     config: ClientConfig,
     backend: Arc<Mutex<Box<dyn ClipboardBackend>>>,
-    relay: Arc<HttpRelayClient>,
+    relay: Arc<CloudflareRelay>,
+    outgoing: mpsc::Sender<ClientWsMessage>,
     last_local_hash: Arc<Mutex<String>>,
 ) -> Result<()> {
     loop {
@@ -108,20 +126,21 @@ async fn local_push_loop(
         };
 
         if let Some(item) = item
-            && let Some(request) = item_to_push_request(&config, item)?
+            && let Some(payload) = local_payload_for_item(&config, item)?
         {
-            let should_push = *last_local_hash.lock().unwrap() != request.payload_hash;
+            let should_push = *last_local_hash.lock().unwrap() != payload.payload_hash;
 
             if should_push {
                 log::info!(
                     "pushing local clipboard update: id={}, kind={}, hash={}",
-                    request.message_id,
-                    request.kind.as_str(),
-                    hash_prefix(&request.payload_hash)
+                    payload.message_id,
+                    payload.kind.as_str(),
+                    hash_prefix(&payload.payload_hash)
                 );
-                match relay.push(&request).await {
-                    Ok(_) => *last_local_hash.lock().unwrap() = request.payload_hash,
-                    Err(err) => log::warn!("push failed: {:?}", err),
+                let payload_hash = payload.payload_hash.clone();
+                match send_payload(&relay, &outgoing, payload).await {
+                    Ok(_) => *last_local_hash.lock().unwrap() = payload_hash,
+                    Err(err) => log::warn!("send failed: {:?}", err),
                 }
             }
         }
@@ -130,56 +149,74 @@ async fn local_push_loop(
     }
 }
 
-async fn remote_pull_loop(
-    config: ClientConfig,
-    backend: Arc<Mutex<Box<dyn ClipboardBackend>>>,
-    relay: Arc<HttpRelayClient>,
-    recent_ids: Arc<Mutex<VecDeque<String>>>,
-    last_local_hash: Arc<Mutex<String>>,
+async fn send_payload(
+    relay: &CloudflareRelay,
+    outgoing: &mpsc::Sender<ClientWsMessage>,
+    payload: LocalPayload,
 ) -> Result<()> {
-    let mut last_seen_sequence = 0;
-    let mut is_initial_pull = true;
-
-    loop {
-        match relay.pull(&config.client_id, last_seen_sequence).await {
-            Ok(response) => {
-                last_seen_sequence = response.latest_sequence;
-                for message in messages_for_pull(is_initial_pull, response.messages) {
-                    let mut backend = backend.lock().unwrap();
-                    apply_remote_message(
-                        &config,
-                        &mut **backend,
-                        message,
-                        &recent_ids,
-                        &last_local_hash,
-                    )?;
-                }
-                is_initial_pull = false;
-            }
-            Err(err) => log::warn!("pull failed: {:?}", err),
+    match payload.route {
+        OutgoingPayloadRoute::Inline => {
+            outgoing
+                .send(ClientWsMessage::PublishInline {
+                    message_id: payload.message_id,
+                    kind: payload.kind,
+                    payload_hash: payload.payload_hash,
+                    filename: payload.filename,
+                    bytes_base64: BASE64_STANDARD.encode(payload.bytes),
+                })
+                .await?;
         }
-
-        tokio::time::sleep(Duration::from_millis(config.remote_poll_interval_ms)).await;
+        OutgoingPayloadRoute::R2 => {
+            let size = payload.bytes.len();
+            let object_key = relay
+                .upload_object(
+                    &payload.message_id,
+                    payload.filename.as_deref(),
+                    payload.bytes,
+                )
+                .await?;
+            outgoing
+                .send(ClientWsMessage::PublishR2 {
+                    message_id: payload.message_id,
+                    kind: payload.kind,
+                    payload_hash: payload.payload_hash,
+                    filename: payload.filename,
+                    object_key,
+                    size,
+                    expires_at: expires_at_24h(),
+                })
+                .await?;
+        }
     }
+
+    Ok(())
 }
 
-fn item_to_push_request(config: &ClientConfig, item: ClipboardItem) -> Result<Option<PushRequest>> {
-    let Some(payload) = local_payload_for_item(config, item)? else {
-        return Ok(None);
-    };
-    if payload.route != OutgoingPayloadRoute::Inline {
-        log::warn!("local payload requires R2 and cannot be sent through HTTP relay");
-        return Ok(None);
+async fn remote_receive_loop(
+    config: ClientConfig,
+    backend: Arc<Mutex<Box<dyn ClipboardBackend>>>,
+    relay: Arc<CloudflareRelay>,
+    mut incoming: mpsc::Receiver<ServerWsMessage>,
+    last_local_hash: Arc<Mutex<String>>,
+    last_seen_sequence: &mut u64,
+) -> Result<()> {
+    while let Some(message) = incoming.recv().await {
+        match message {
+            ServerWsMessage::HelloAck { latest_sequence } => {
+                *last_seen_sequence = latest_sequence;
+            }
+            ServerWsMessage::Error { message } => {
+                log::warn!("relay error: {}", message);
+            }
+            ServerWsMessage::Message(message) => {
+                *last_seen_sequence = message.sequence;
+                apply_remote_message(&config, &relay, backend.clone(), message, &last_local_hash)
+                    .await?;
+            }
+        }
     }
 
-    Ok(Some(PushRequest {
-        client_id: config.client_id.clone(),
-        message_id: payload.message_id,
-        kind: payload.kind,
-        payload_hash: payload.payload_hash,
-        filename: payload.filename,
-        bytes_base64: BASE64_STANDARD.encode(payload.bytes),
-    }))
+    Ok(())
 }
 
 pub fn local_payload_for_item(
@@ -229,45 +266,24 @@ pub fn local_payload_for_item(
     }))
 }
 
-fn apply_remote_message(
+async fn apply_remote_message(
     config: &ClientConfig,
-    backend: &mut dyn ClipboardBackend,
+    relay: &CloudflareRelay,
+    backend: Arc<Mutex<Box<dyn ClipboardBackend>>>,
     message: RelayMessage,
-    recent_ids: &Arc<Mutex<VecDeque<String>>>,
     last_local_hash: &Arc<Mutex<String>>,
 ) -> Result<()> {
     if message.source == config.client_id {
         return Ok(());
     }
 
-    {
-        let mut ids = recent_ids.lock().unwrap();
-        if ids.contains(&message.message_id) {
-            return Ok(());
-        }
-        ids.push_back(message.message_id.clone());
-        while ids.len() > 128 {
-            ids.pop_front();
-        }
-    }
-
-    let bytes = match &message.payload {
-        RelayPayload::Inline { bytes_base64 } => BASE64_STANDARD.decode(bytes_base64)?,
-        RelayPayload::R2 { .. } => {
-            log::warn!("remote R2 payload cannot be applied through HTTP polling client");
-            return Ok(());
-        }
+    let bytes = bytes_from_message(relay, &message).await?;
+    let Some(bytes) = validate_remote_bytes(&message, bytes) else {
+        return Ok(());
     };
-    if bytes.len() > config.max_payload_bytes {
-        log::warn!("remote payload exceeds configured limit");
-        return Ok(());
-    }
-    let payload_hash = calculate_bytes_hash(&bytes);
-    if payload_hash != message.payload_hash {
-        log::warn!("remote payload hash mismatch");
-        return Ok(());
-    }
+    let payload_hash = message.payload_hash.clone();
 
+    let mut backend = backend.lock().unwrap();
     match message.kind {
         PayloadKind::Text => {
             let text = String::from_utf8(bytes)?;
@@ -310,12 +326,42 @@ fn apply_remote_message(
     Ok(())
 }
 
-fn messages_for_pull(is_initial_pull: bool, messages: Vec<RelayMessage>) -> Vec<RelayMessage> {
-    if is_initial_pull {
-        messages.into_iter().next_back().into_iter().collect()
-    } else {
-        messages
+async fn bytes_from_message(relay: &CloudflareRelay, message: &RelayMessage) -> Result<Vec<u8>> {
+    match &message.payload {
+        RelayPayload::Inline { bytes_base64 } => Ok(BASE64_STANDARD.decode(bytes_base64)?),
+        RelayPayload::R2 { .. } => {
+            relay
+                .download_object(&message.message_id, message.filename.as_deref())
+                .await
+        }
     }
+}
+
+fn bytes_from_inline_message(message: &RelayMessage) -> Result<Option<Vec<u8>>> {
+    match &message.payload {
+        RelayPayload::Inline { bytes_base64 } => {
+            let bytes = BASE64_STANDARD.decode(bytes_base64)?;
+            Ok(validate_remote_bytes(message, bytes))
+        }
+        RelayPayload::R2 { .. } => Ok(None),
+    }
+}
+
+fn validate_remote_bytes(message: &RelayMessage, bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let payload_hash = calculate_bytes_hash(&bytes);
+    if payload_hash != message.payload_hash {
+        log::warn!("remote payload hash mismatch");
+        return None;
+    }
+    Some(bytes)
+}
+
+fn expires_at_24h() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    now + 24 * 60 * 60
 }
 
 fn hash_prefix(hash: &str) -> &str {
@@ -386,29 +432,39 @@ mod tests {
     }
 
     #[test]
-    fn initial_pull_applies_only_latest_remote_message() {
-        let messages = vec![
-            test_relay_message(1, "m1"),
-            test_relay_message(2, "m2"),
-            test_relay_message(3, "m3"),
-        ];
+    fn inline_text_message_decodes_to_bytes() {
+        let message = RelayMessage {
+            sequence: 1,
+            source: "client-b".to_string(),
+            message_id: "m1".to_string(),
+            kind: PayloadKind::Text,
+            payload_hash: calculate_bytes_hash(b"hello"),
+            filename: None,
+            payload: RelayPayload::Inline {
+                bytes_base64: BASE64_STANDARD.encode(b"hello"),
+            },
+        };
 
-        let selected = messages_for_pull(true, messages);
+        let bytes = bytes_from_inline_message(&message).unwrap().unwrap();
 
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].sequence, 3);
-        assert_eq!(selected[0].message_id, "m3");
+        assert_eq!(bytes, b"hello");
     }
 
     #[test]
-    fn incremental_pull_applies_all_remote_messages() {
-        let messages = vec![test_relay_message(4, "m4"), test_relay_message(5, "m5")];
+    fn hash_mismatch_is_rejected_before_apply() {
+        let message = RelayMessage {
+            sequence: 1,
+            source: "client-b".to_string(),
+            message_id: "m1".to_string(),
+            kind: PayloadKind::Text,
+            payload_hash: "bad".to_string(),
+            filename: None,
+            payload: RelayPayload::Inline {
+                bytes_base64: BASE64_STANDARD.encode(b"hello"),
+            },
+        };
 
-        let selected = messages_for_pull(false, messages);
-
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].sequence, 4);
-        assert_eq!(selected[1].sequence, 5);
+        assert!(bytes_from_inline_message(&message).unwrap().is_none());
     }
 
     fn test_config() -> ClientConfig {
@@ -421,20 +477,6 @@ mod tests {
             remote_poll_interval_ms: 500,
             receive_dir: "receive".to_string(),
             max_payload_bytes: 10 * 1024 * 1024,
-        }
-    }
-
-    fn test_relay_message(sequence: u64, message_id: &str) -> RelayMessage {
-        RelayMessage {
-            sequence,
-            source: "client-b".to_string(),
-            message_id: message_id.to_string(),
-            kind: PayloadKind::Text,
-            payload_hash: calculate_bytes_hash(message_id.as_bytes()),
-            filename: None,
-            payload: RelayPayload::Inline {
-                bytes_base64: BASE64_STANDARD.encode(message_id),
-            },
         }
     }
 
