@@ -1,4 +1,5 @@
 mod clipboard;
+mod cloudflare;
 mod config;
 mod file_transfer;
 mod network;
