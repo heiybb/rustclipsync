@@ -102,8 +102,8 @@ export function objectKeyFor(
   )}/${safeSegment(filename)}`;
 }
 
-function optionalString(value: unknown): value is string | undefined {
-  return value === undefined || typeof value === "string";
+function optionalString(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === "string";
 }
 
 function safeSegment(value: string): string {

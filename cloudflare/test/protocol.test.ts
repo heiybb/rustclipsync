@@ -24,6 +24,19 @@ describe("client message validation", () => {
       }),
     ).toBe(true);
   });
+
+  it("accepts publish_inline with null filename from older clients", () => {
+    expect(
+      isValidClientMessage({
+        type: "publish_inline",
+        message_id: "message-1",
+        kind: "text",
+        payload_hash: "hash",
+        filename: null,
+        bytes_base64: "aGVsbG8=",
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("R2 object keys", () => {

@@ -20,6 +20,7 @@ pub enum ClientWsMessage {
         message_id: String,
         kind: PayloadKind,
         payload_hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
         bytes_base64: String,
     },
@@ -27,6 +28,7 @@ pub enum ClientWsMessage {
         message_id: String,
         kind: PayloadKind,
         payload_hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
         object_key: String,
         size: usize,
@@ -49,6 +51,7 @@ pub struct RelayMessage {
     pub message_id: String,
     pub kind: PayloadKind,
     pub payload_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     pub payload: RelayPayload,
 }
@@ -126,5 +129,39 @@ mod tests {
         assert!(json.get("bytes_base64").is_none());
         assert_eq!(json["payload"]["mode"], "inline");
         assert_eq!(json["payload"]["bytes_base64"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn publish_inline_omits_missing_filename() {
+        let message = ClientWsMessage::PublishInline {
+            message_id: "message-1".to_string(),
+            kind: PayloadKind::Text,
+            payload_hash: "hash".to_string(),
+            filename: None,
+            bytes_base64: "aGVsbG8=".to_string(),
+        };
+
+        let json = serde_json::to_value(message).unwrap();
+
+        assert_eq!(json["type"], "publish_inline");
+        assert!(json.get("filename").is_none());
+    }
+
+    #[test]
+    fn publish_r2_omits_missing_filename() {
+        let message = ClientWsMessage::PublishR2 {
+            message_id: "message-1".to_string(),
+            kind: PayloadKind::File,
+            payload_hash: "hash".to_string(),
+            filename: None,
+            object_key: "rooms/default/messages/message-1/payload.bin".to_string(),
+            size: 42,
+            expires_at: 1_777_777_777,
+        };
+
+        let json = serde_json::to_value(message).unwrap();
+
+        assert_eq!(json["type"], "publish_r2");
+        assert!(json.get("filename").is_none());
     }
 }
