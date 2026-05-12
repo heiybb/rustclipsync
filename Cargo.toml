@@ -1,0 +1,44 @@
+[package]
+name = "rustclipsync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+urlencoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+base64 = "0.22.1"
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+indicatif = "0.17"
+bytes = "1"
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4.1"
+windows-sys = { version = "0.59", features = ["Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }
+
+[dev-dependencies]
+filetime = "0.2"
+
+[profile.release]
+# 告诉编译器优化查找速度的同时尽量减小体积
+opt-level = 'z'
+
+# 开启全局链接优化（LTO），能大幅削减掉跨 crate 的无用代码
+lto = true
+
+# 将 codegen-units 设为 1，虽然编译变慢，但能提供更好的压缩效果
+#codegen-units = 1
+
+# 直接剥离符号表（移除调试信息），这一步对体积影响极大
+strip = true
