@@ -1,0 +1,12 @@
+# rustclipsync configuration
+server_url = "https://your-relay.workers.dev"
+auth_token = "your-secret-token"
+
+# Optional: Custom name for this device (defaults to hostname)
+# client_name = "my-desktop"
+
+# Optional: How often to poll local clipboard in ms
+# poll_interval_ms = 300
+
+# Optional: Where to save received files
+# receive_dir = "receive"

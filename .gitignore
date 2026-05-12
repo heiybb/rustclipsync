@@ -1,0 +1,10 @@
+/target
+.worktrees/
+.idea/
+docs/
+scripts/
+receive/
+*.bak
+build_error.txt
+.env
+.env.*
