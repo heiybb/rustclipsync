@@ -60,29 +60,53 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let relay = Arc::new(CloudflareRelay::new(config.clone()));
     let mut last_seen_sequence = 0;
 
+    let (local_tx, mut local_rx) = mpsc::channel::<LocalPayload>(1);
+    let mut local_send_task = tokio::spawn(local_send_loop(
+        config.clone(),
+        backend.clone(),
+        watcher.clone(),
+        local_tx,
+        last_local_hash.clone(),
+    ));
+
     loop {
         match relay.connect(last_seen_sequence).await {
             Ok((outgoing, incoming)) => {
-                let local_task = tokio::spawn(local_send_loop(
-                    config.clone(),
-                    backend.clone(),
-                    watcher.clone(),
-                    relay.clone(),
-                    outgoing,
-                    last_local_hash.clone(),
-                ));
-                let remote_result = remote_receive_loop(
+                let forwarder_fut = async {
+                    while let Some(payload) = local_rx.recv().await {
+                        send_payload(&relay, &outgoing, payload).await?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                };
+
+                let receiver_fut = remote_receive_loop(
                     config.clone(),
                     backend.clone(),
                     relay.clone(),
                     incoming,
                     last_local_hash.clone(),
                     &mut last_seen_sequence,
-                )
-                .await;
-                local_task.abort();
-                if let Err(err) = remote_result {
-                    log::warn!("remote receive failed: {:?}", err);
+                );
+
+                tokio::select! {
+                    res = forwarder_fut => {
+                        if let Err(err) = res {
+                            log::warn!("local forwarder failed: {:?}", err);
+                        }
+                    }
+                    res = receiver_fut => {
+                        if let Err(err) = res {
+                            log::warn!("remote receiver failed: {:?}", err);
+                        }
+                    }
+                    res = &mut local_send_task => {
+                        match res {
+                            Ok(Ok(())) => log::info!("local send task exited normally"),
+                            Ok(Err(err)) => log::error!("local send task failed: {:?}", err),
+                            Err(err) => log::error!("local send task panicked: {:?}", err),
+                        }
+                        break;
+                    }
                 }
             }
             Err(err) => log::warn!("websocket connect failed: {:?}", err),
@@ -90,6 +114,8 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+
+    local_send_task.abort();
 
     #[allow(unreachable_code)]
     {
@@ -119,8 +145,7 @@ async fn local_send_loop(
     config: ClientConfig,
     backend: Arc<Mutex<Box<dyn ClipboardBackend>>>,
     watcher: Arc<Mutex<Box<dyn ClipboardWatcher>>>,
-    relay: Arc<CloudflareRelay>,
-    outgoing: mpsc::Sender<ClientWsMessage>,
+    local_tx: mpsc::Sender<LocalPayload>,
     last_local_hash: Arc<Mutex<String>>,
 ) -> Result<()> {
     loop {
@@ -142,16 +167,17 @@ async fn local_send_loop(
                     hash_prefix(&payload.payload_hash)
                 );
                 let payload_hash = payload.payload_hash.clone();
-                match send_payload(&relay, &outgoing, payload).await {
-                    Ok(_) => *last_local_hash.lock().unwrap() = payload_hash,
-                    Err(err) => log::warn!("send failed: {:?}", err),
+                if local_tx.send(payload).await.is_err() {
+                    break;
                 }
+                *last_local_hash.lock().unwrap() = payload_hash;
             }
         }
 
         let watcher = watcher.clone();
         tokio::task::spawn_blocking(move || watcher.lock().unwrap().wait_for_change()).await??;
     }
+    Ok(())
 }
 
 async fn send_payload(

@@ -3,6 +3,7 @@ use crate::protocol::{ClientWsMessage, ServerWsMessage};
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -48,36 +49,84 @@ impl CloudflareRelay {
             .send(Message::Text(serde_json::to_string(&hello)?.into()))
             .await?;
 
+        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+
         tokio::spawn(async move {
-            while let Some(message) = out_rx.recv().await {
-                match serde_json::to_string(&message) {
-                    Ok(json) => {
-                        if write.send(Message::Text(json.into())).await.is_err() {
+            let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
+            ping_interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    message = out_rx.recv() => {
+                        match message {
+                            Some(message) => {
+                                match serde_json::to_string(&message) {
+                                    Ok(json) => {
+                                        if write.send(Message::Text(json.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => log::warn!("failed to encode websocket message: {:?}", err),
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = ping_interval.tick() => {
+                        if write.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
                             break;
                         }
                     }
-                    Err(err) => log::warn!("failed to encode websocket message: {:?}", err),
                 }
             }
+            let _ = close_tx.send(());
         });
 
         tokio::spawn(async move {
-            while let Some(message) = read.next().await {
-                match message {
-                    Ok(Message::Text(text)) => {
-                        match serde_json::from_str::<ServerWsMessage>(&text) {
-                            Ok(decoded) => {
-                                if in_tx.send(decoded).await.is_err() {
-                                    break;
+            loop {
+                tokio::select! {
+                    message = read.next() => {
+                        match message {
+                            Some(Ok(Message::Text(text))) => {
+                                match serde_json::from_str::<ServerWsMessage>(&text) {
+                                    Ok(decoded) => {
+                                        if in_tx.send(decoded).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => log::warn!("failed to decode websocket message: {:?}", err),
                                 }
                             }
-                            Err(err) => log::warn!("failed to decode websocket message: {:?}", err),
+                            Some(Ok(Message::Close(_))) => break,
+                            Some(Ok(_)) => {}
+                            Some(Err(err)) => {
+                                match &err {
+                                    tokio_tungstenite::tungstenite::Error::ConnectionClosed => {
+                                        log::info!("websocket connection closed by remote peer");
+                                    }
+                                    tokio_tungstenite::tungstenite::Error::Protocol(
+                                        tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                                    ) => {
+                                        log::info!("websocket connection reset by remote peer without closing handshake");
+                                    }
+                                    tokio_tungstenite::tungstenite::Error::Io(io_err)
+                                        if io_err.kind() == std::io::ErrorKind::ConnectionReset
+                                            || io_err.kind() == std::io::ErrorKind::ConnectionAborted
+                                            || io_err.kind() == std::io::ErrorKind::BrokenPipe
+                                            || io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                                    {
+                                        log::info!("websocket connection dropped: {:?}", io_err);
+                                    }
+                                    _ => {
+                                        log::warn!("websocket read failed: {:?}", err);
+                                    }
+                                }
+                                break;
+                            }
+                            None => break,
                         }
                     }
-                    Ok(Message::Close(_)) => break,
-                    Ok(_) => {}
-                    Err(err) => {
-                        log::warn!("websocket read failed: {:?}", err);
+                    _ = &mut close_rx => {
                         break;
                     }
                 }
