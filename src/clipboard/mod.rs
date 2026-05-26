@@ -99,6 +99,11 @@ pub fn mark_current_text_seen(last_text: &mut String, text: Result<String, arboa
     }
 }
 
+pub(crate) fn clipboard_text_looks_like_png_bytes(text: &str) -> bool {
+    text.as_bytes().starts_with(b"\xef\xbf\xbdPNG\r\n\x1a\n")
+        || text.starts_with("\u{89}PNG\r\n\x1a\n")
+}
+
 #[cfg(any(not(windows), test))]
 fn select_backend_name(session_type: Option<&str>, is_windows: bool) -> &'static str {
     if is_windows {
@@ -130,5 +135,11 @@ mod tests {
     fn falls_back_to_arboard_for_unknown_linux_session() {
         let backend = select_backend_name(Some("unknown"), false);
         assert_eq!(backend, "arboard");
+    }
+
+    #[test]
+    fn detects_png_bytes_exposed_as_clipboard_text() {
+        let text = String::from_utf8_lossy(b"\x89PNG\r\n\x1a\n").to_string();
+        assert!(clipboard_text_looks_like_png_bytes(&text));
     }
 }

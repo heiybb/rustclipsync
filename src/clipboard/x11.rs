@@ -1,4 +1,4 @@
-use super::{ClipboardBackend, ClipboardItem};
+use super::{ClipboardBackend, ClipboardItem, clipboard_text_looks_like_png_bytes};
 use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -62,7 +62,7 @@ impl ClipboardBackend for X11Backend {
         }
         if let Some(bytes) = Self::read_target("text/plain")? {
             let text = String::from_utf8_lossy(&bytes).to_string();
-            if text != self.last_text {
+            if text != self.last_text && !clipboard_text_looks_like_png_bytes(&text) {
                 self.last_text = text.clone();
                 return Ok(Some(ClipboardItem::Text(text)));
             }
@@ -83,4 +83,16 @@ fn calculate_bytes_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn png_bytes_exposed_as_text_are_not_emitted() {
+        let png_text = String::from_utf8_lossy(b"\x89PNG\r\n\x1a\n").to_string();
+
+        assert!(clipboard_text_looks_like_png_bytes(&png_text));
+    }
 }

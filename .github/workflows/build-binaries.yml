@@ -46,42 +46,11 @@ jobs:
           path: dist/rustclipsync-ubuntu-x86_64
           if-no-files-found: error
 
-  build-windows-x86_64:
-    name: Windows x86_64
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Select Rust stable
-        run: rustup default stable
-
-      - name: Add target
-        run: rustup target add x86_64-pc-windows-msvc
-
-      - name: Build release binary
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
-
-      - name: Package binary
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item -LiteralPath target\x86_64-pc-windows-msvc\release\rustclipsync.exe -Destination dist\rustclipsync-windows-x86_64.exe -Force
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: rustclipsync-windows-x86_64
-          path: dist/rustclipsync-windows-x86_64.exe
-          if-no-files-found: error
-
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs:
       - build-ubuntu-x86_64
-      - build-windows-x86_64
     permissions:
       actions: read
       contents: write
@@ -94,8 +63,7 @@ jobs:
           gh run download "$GITHUB_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
             --dir release-assets \
-            --name rustclipsync-ubuntu-x86_64 \
-            --name rustclipsync-windows-x86_64
+            --name rustclipsync-ubuntu-x86_64
 
       - name: Publish release
         env:
@@ -108,14 +76,13 @@ jobs:
           title="Build ${short_sha}"
           notes="Automated x86_64 build for commit ${GITHUB_SHA}."
           ubuntu_asset="release-assets/rustclipsync-ubuntu-x86_64/rustclipsync-ubuntu-x86_64"
-          windows_asset="release-assets/rustclipsync-windows-x86_64/rustclipsync-windows-x86_64.exe"
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" "$ubuntu_asset" "$windows_asset" \
+            gh release upload "$tag" "$ubuntu_asset" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber
           else
-            gh release create "$tag" "$ubuntu_asset" "$windows_asset" \
+            gh release create "$tag" "$ubuntu_asset" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$title" \

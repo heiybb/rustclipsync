@@ -1,6 +1,6 @@
 use super::{
     ClipboardBackend, ClipboardItem, canonical_image_hash_from_png, canonical_image_hash_from_rgba,
-    mark_current_text_seen, rgba_to_png,
+    clipboard_text_looks_like_png_bytes, mark_current_text_seen, rgba_to_png,
 };
 use anyhow::Result;
 use arboard::{Clipboard, ImageData};
@@ -70,11 +70,6 @@ impl ClipboardBackend for ArboardBackend {
             ClipboardItem::FilePath(_) => Ok(()),
         }
     }
-}
-
-fn clipboard_text_looks_like_png_bytes(text: &str) -> bool {
-    text.as_bytes().starts_with(b"\xef\xbf\xbdPNG\r\n\x1a\n")
-        || text.starts_with("\u{89}PNG\r\n\x1a\n")
 }
 
 #[cfg(test)]
