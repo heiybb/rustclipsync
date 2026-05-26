@@ -75,7 +75,13 @@ jobs:
           tag="build-${short_sha}"
           title="Build ${short_sha}"
           notes="Automated x86_64 build for commit ${GITHUB_SHA}."
-          ubuntu_asset="release-assets/rustclipsync-ubuntu-x86_64/rustclipsync-ubuntu-x86_64"
+          ubuntu_asset="$(find release-assets -type f -name rustclipsync-ubuntu-x86_64 -print -quit)"
+
+          if [ -z "$ubuntu_asset" ]; then
+            echo "Ubuntu artifact not found under release-assets"
+            find release-assets -maxdepth 3 -type f -print
+            exit 1
+          fi
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" "$ubuntu_asset" \
