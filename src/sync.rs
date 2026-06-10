@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 const RECEIVE_FILE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECEIVE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
-pub const INLINE_PAYLOAD_LIMIT_BYTES: usize = 100 * 1024;
+pub const INLINE_PAYLOAD_LIMIT_BYTES: usize = 10 * 1024;
 pub const R2_PAYLOAD_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
