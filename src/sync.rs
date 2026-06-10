@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 const RECEIVE_FILE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECEIVE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
-pub const INLINE_PAYLOAD_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+pub const INLINE_PAYLOAD_LIMIT_BYTES: usize = 100 * 1024;
 pub const R2_PAYLOAD_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn ten_mb_file_uses_inline_route() {
+    fn hundred_kb_file_uses_inline_route() {
         let (_root, file_path) = sparse_test_file(INLINE_PAYLOAD_LIMIT_BYTES as u64);
         let config = test_config();
         let payload = local_payload_for_item(&config, ClipboardItem::FilePath(file_path))
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn file_above_ten_mb_uses_r2_route() {
+    fn file_above_hundred_kb_uses_r2_route() {
         let (_root, file_path) = sparse_test_file((INLINE_PAYLOAD_LIMIT_BYTES + 1) as u64);
         let config = test_config();
         let payload = local_payload_for_item(&config, ClipboardItem::FilePath(file_path))

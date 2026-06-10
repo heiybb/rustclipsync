@@ -8,7 +8,7 @@ import {
 
 describe("protocol limits", () => {
   it("uses the confirmed Cloudflare payload limits", () => {
-    expect(INLINE_LIMIT_BYTES).toBe(10 * 1024 * 1024);
+    expect(INLINE_LIMIT_BYTES).toBe(100 * 1024);
     expect(R2_LIMIT_BYTES).toBe(100 * 1024 * 1024);
   });
 });

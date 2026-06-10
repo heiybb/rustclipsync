@@ -1,4 +1,4 @@
-export const INLINE_LIMIT_BYTES = 10 * 1024 * 1024;
+export const INLINE_LIMIT_BYTES = 100 * 1024;
 export const R2_LIMIT_BYTES = 100 * 1024 * 1024;
 export const DEFAULT_ROOM = "default";
 
