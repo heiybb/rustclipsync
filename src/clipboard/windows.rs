@@ -3,9 +3,8 @@ use super::{
     canonical_image_hash_from_rgba, mark_current_text_seen, rgba_to_png,
 };
 use anyhow::Result;
-use arboard::{Clipboard, ImageData};
+use arboard::Clipboard;
 use clipboard_win::{Clipboard as WinClipboard, Getter, formats::FileList};
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -165,6 +164,30 @@ impl ClipboardBackend for WindowsBackend {
             }
         }
 
+        // Try custom "PNG" format first to preserve transparency and avoid quality loss.
+        if let Some(png_format_id) = clipboard_win::register_format("PNG") {
+            let format_id = png_format_id.get();
+            if clipboard_win::is_format_avail(format_id) {
+                if let Ok(_clip) = WinClipboard::new_attempts(10) {
+                    let mut png_bytes = Vec::new();
+                    use clipboard_win::Getter;
+                    if clipboard_win::formats::RawData(format_id).read_clipboard(&mut png_bytes).is_ok()
+                        && !png_bytes.is_empty()
+                    {
+                        if let Ok(hash) = canonical_image_hash_from_png(&png_bytes) {
+                            if hash != self.last_image_hash {
+                                self.last_image_hash = hash;
+                                return Ok(Some(ClipboardItem::ImagePng(png_bytes)));
+                            }
+                            // If hash is same, we don't fall back (it's the same image)
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to standard CF_DIB image via arboard
         if let Ok(image) = self.clipboard.get_image() {
             let png = rgba_to_png(image.width, image.height, image.bytes.as_ref())?;
             let hash =
@@ -186,15 +209,45 @@ impl ClipboardBackend for WindowsBackend {
             }
             ClipboardItem::ImagePng(bytes) => {
                 let image = image::load_from_memory(&bytes)?.to_rgba8();
-                let width = image.width() as usize;
-                let height = image.height() as usize;
-                let raw = image.into_raw();
+                let width = image.width();
+                let height = image.height();
+                let mut bgra = image.into_raw();
+                // Swap R and B channels to get BGRA
+                for chunk in bgra.chunks_exact_mut(4) {
+                    chunk.swap(0, 2);
+                }
 
-                self.clipboard.set_image(ImageData {
-                    width,
-                    height,
-                    bytes: Cow::Owned(raw),
-                })?;
+                // Construct CF_DIB payload
+                let mut dib_payload = Vec::with_capacity(40 + bgra.len());
+                // Write BITMAPINFOHEADER
+                dib_payload.extend_from_slice(&40u32.to_ne_bytes());
+                dib_payload.extend_from_slice(&(width as i32).to_ne_bytes());
+                dib_payload.extend_from_slice(&(-(height as i32)).to_ne_bytes());
+                dib_payload.extend_from_slice(&1u16.to_ne_bytes());
+                dib_payload.extend_from_slice(&32u16.to_ne_bytes());
+                dib_payload.extend_from_slice(&0u32.to_ne_bytes());
+                dib_payload.extend_from_slice(&(bgra.len() as u32).to_ne_bytes());
+                dib_payload.extend_from_slice(&0i32.to_ne_bytes());
+                dib_payload.extend_from_slice(&0i32.to_ne_bytes());
+                dib_payload.extend_from_slice(&0u32.to_ne_bytes());
+                dib_payload.extend_from_slice(&0u32.to_ne_bytes());
+                dib_payload.extend_from_slice(&bgra);
+
+                // Open clipboard, empty it, and set both formats
+                {
+                    let _clip = WinClipboard::new_attempts(10)
+                        .map_err(|e| anyhow::anyhow!("windows clipboard lock error: {:?}", e))?;
+                    clipboard_win::empty()
+                        .map_err(|e| anyhow::anyhow!("windows clipboard empty error: {:?}", e))?;
+
+                    // Write custom "PNG" format first
+                    if let Some(png_format_id) = clipboard_win::register_format("PNG") {
+                        let _ = clipboard_win::raw::set_without_clear(png_format_id.get(), &bytes);
+                    }
+
+                    // Write CF_DIB format
+                    let _ = clipboard_win::raw::set_without_clear(8, &dib_payload);
+                }
 
                 self.last_image_hash = canonical_image_hash_from_png(&bytes)?;
                 mark_current_text_seen(&mut self.last_text, self.clipboard.get_text());
@@ -213,5 +266,32 @@ mod tests {
     fn backend_name_is_windows() {
         let backend = WindowsBackend::new().unwrap();
         assert_eq!(backend.name(), "windows");
+    }
+
+    #[test]
+    fn test_png_clipboard_roundtrip() {
+        let mut backend = WindowsBackend::new().unwrap();
+        // Construct a small 2x2 red PNG
+        let image = image::RgbaImage::from_fn(2, 2, |_, _| image::Rgba([255, 0, 0, 255]));
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png_bytes, image::ImageFormat::Png).unwrap();
+        let png_bytes = png_bytes.into_inner();
+
+        // Write it using write_item
+        backend.write_item(ClipboardItem::ImagePng(png_bytes.clone())).unwrap();
+
+        // Read it back using read_snapshot
+        // We clear last_image_hash to force it to read
+        backend.last_image_hash = String::new();
+        let item = backend.read_snapshot().unwrap().unwrap();
+        match item {
+            ClipboardItem::ImagePng(retrieved_bytes) => {
+                let decoded = image::load_from_memory(&retrieved_bytes).unwrap().to_rgba8();
+                assert_eq!(decoded.width(), 2);
+                assert_eq!(decoded.height(), 2);
+                assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+            }
+            _ => panic!("Expected ImagePng"),
+        }
     }
 }
