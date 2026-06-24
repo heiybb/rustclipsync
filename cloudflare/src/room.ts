@@ -155,12 +155,21 @@ export class SyncRoom implements DurableObject {
   private broadcast(message: RelayMessage): void {
     for (const session of this.sessions) {
       if (session.clientId !== message.source) {
-        send(session.socket, { type: "message", ...message });
+        // A dead/closing socket throws on send; isolate it so one stale peer
+        // can't abort delivery to the remaining live sessions, and drop it.
+        if (!send(session.socket, { type: "message", ...message })) {
+          this.sessions.delete(session);
+        }
       }
     }
   }
 }
 
-function send(socket: WebSocket, message: ServerMessage): void {
-  socket.send(JSON.stringify(message));
+function send(socket: WebSocket, message: ServerMessage): boolean {
+  try {
+    socket.send(JSON.stringify(message));
+    return true;
+  } catch {
+    return false;
+  }
 }

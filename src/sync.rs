@@ -55,17 +55,24 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     );
 
     let last_local_hash = Arc::new(Mutex::new(String::new()));
+    // The current local-origin clipboard content, if any. Re-sent on every
+    // (re)connect so content that was in flight when a connection dropped is
+    // not silently lost; cleared when remote content replaces the clipboard.
+    let pending_local: Arc<Mutex<Option<Arc<LocalPayload>>>> = Arc::new(Mutex::new(None));
     let _receive_cleanup_task =
         tokio::spawn(receive_cleanup_loop(PathBuf::from(&config.receive_dir)));
     let relay = Arc::new(CloudflareRelay::new(config.clone()));
     let mut last_seen_sequence = 0;
 
-    let (local_tx, mut local_rx) = mpsc::channel::<LocalPayload>(1);
+    // The forwarder is woken by a unit signal; the payload itself travels via
+    // `pending_local` so a fresh connection can always re-read the latest.
+    let (wake_tx, mut wake_rx) = mpsc::channel::<()>(1);
     let mut local_send_task = tokio::spawn(local_send_loop(
         config.clone(),
         backend.clone(),
         watcher.clone(),
-        local_tx,
+        wake_tx,
+        pending_local.clone(),
         last_local_hash.clone(),
     ));
 
@@ -73,8 +80,15 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
         match relay.connect(last_seen_sequence).await {
             Ok((outgoing, incoming)) => {
                 let forwarder_fut = async {
-                    while let Some(payload) = local_rx.recv().await {
-                        send_payload(&relay, &outgoing, payload).await?;
+                    // Drop a wake queued while we were disconnected: the
+                    // send_pending below already covers the latest payload, so
+                    // keeping it would just resend (and re-upload) it twice.
+                    let _ = wake_rx.try_recv();
+                    // Re-deliver the current local clipboard right away so a
+                    // reconnect recovers any update that was lost mid-flight.
+                    send_pending(&relay, &outgoing, &pending_local).await?;
+                    while wake_rx.recv().await.is_some() {
+                        send_pending(&relay, &outgoing, &pending_local).await?;
                     }
                     Ok::<(), anyhow::Error>(())
                 };
@@ -85,6 +99,7 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
                     relay.clone(),
                     incoming,
                     last_local_hash.clone(),
+                    pending_local.clone(),
                     &mut last_seen_sequence,
                 );
 
@@ -145,7 +160,8 @@ async fn local_send_loop(
     config: ClientConfig,
     backend: Arc<Mutex<Box<dyn ClipboardBackend>>>,
     watcher: Arc<Mutex<Box<dyn ClipboardWatcher>>>,
-    local_tx: mpsc::Sender<LocalPayload>,
+    wake_tx: mpsc::Sender<()>,
+    pending_local: Arc<Mutex<Option<Arc<LocalPayload>>>>,
     last_local_hash: Arc<Mutex<String>>,
 ) -> Result<()> {
     loop {
@@ -166,11 +182,15 @@ async fn local_send_loop(
                     payload.kind.as_str(),
                     hash_prefix(&payload.payload_hash)
                 );
-                let payload_hash = payload.payload_hash.clone();
-                if local_tx.send(payload).await.is_err() {
-                    break;
+                *last_local_hash.lock().unwrap() = payload.payload_hash.clone();
+                *pending_local.lock().unwrap() = Some(Arc::new(payload));
+                // Wake the forwarder. A queued wake already covers the latest
+                // `pending_local`, so a full channel is fine to ignore; only a
+                // closed channel (forwarder gone for good) ends the loop.
+                match wake_tx.try_send(()) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+                    Err(mpsc::error::TrySendError::Closed(())) => break,
                 }
-                *last_local_hash.lock().unwrap() = payload_hash;
             }
         }
 
@@ -180,20 +200,32 @@ async fn local_send_loop(
     Ok(())
 }
 
+async fn send_pending(
+    relay: &CloudflareRelay,
+    outgoing: &mpsc::Sender<ClientWsMessage>,
+    pending_local: &Arc<Mutex<Option<Arc<LocalPayload>>>>,
+) -> Result<()> {
+    let payload = pending_local.lock().unwrap().clone();
+    if let Some(payload) = payload {
+        send_payload(relay, outgoing, &payload).await?;
+    }
+    Ok(())
+}
+
 async fn send_payload(
     relay: &CloudflareRelay,
     outgoing: &mpsc::Sender<ClientWsMessage>,
-    payload: LocalPayload,
+    payload: &LocalPayload,
 ) -> Result<()> {
     match payload.route {
         OutgoingPayloadRoute::Inline => {
             outgoing
                 .send(ClientWsMessage::PublishInline {
-                    message_id: payload.message_id,
+                    message_id: payload.message_id.clone(),
                     kind: payload.kind,
-                    payload_hash: payload.payload_hash,
-                    filename: payload.filename,
-                    bytes_base64: BASE64_STANDARD.encode(payload.bytes),
+                    payload_hash: payload.payload_hash.clone(),
+                    filename: payload.filename.clone(),
+                    bytes_base64: BASE64_STANDARD.encode(&payload.bytes),
                 })
                 .await?;
         }
@@ -203,15 +235,15 @@ async fn send_payload(
                 .upload_object(
                     &payload.message_id,
                     payload.filename.as_deref(),
-                    payload.bytes,
+                    payload.bytes.clone(),
                 )
                 .await?;
             outgoing
                 .send(ClientWsMessage::PublishR2 {
-                    message_id: payload.message_id,
+                    message_id: payload.message_id.clone(),
                     kind: payload.kind,
-                    payload_hash: payload.payload_hash,
-                    filename: payload.filename,
+                    payload_hash: payload.payload_hash.clone(),
+                    filename: payload.filename.clone(),
                     object_key,
                     size,
                     expires_at: expires_at_24h(),
@@ -229,6 +261,7 @@ async fn remote_receive_loop(
     relay: Arc<CloudflareRelay>,
     mut incoming: mpsc::Receiver<ServerWsMessage>,
     last_local_hash: Arc<Mutex<String>>,
+    pending_local: Arc<Mutex<Option<Arc<LocalPayload>>>>,
     last_seen_sequence: &mut u64,
 ) -> Result<()> {
     while let Some(message) = incoming.recv().await {
@@ -241,8 +274,15 @@ async fn remote_receive_loop(
             }
             ServerWsMessage::Message(message) => {
                 *last_seen_sequence = message.sequence;
-                apply_remote_message(&config, &relay, backend.clone(), message, &last_local_hash)
-                    .await?;
+                apply_remote_message(
+                    &config,
+                    &relay,
+                    backend.clone(),
+                    message,
+                    &last_local_hash,
+                    &pending_local,
+                )
+                .await?;
             }
         }
     }
@@ -303,6 +343,7 @@ async fn apply_remote_message(
     backend: Arc<Mutex<Box<dyn ClipboardBackend>>>,
     message: RelayMessage,
     last_local_hash: &Arc<Mutex<String>>,
+    pending_local: &Arc<Mutex<Option<Arc<LocalPayload>>>>,
 ) -> Result<()> {
     if message.source == config.client_id {
         return Ok(());
@@ -321,6 +362,9 @@ async fn apply_remote_message(
             let size = text.len();
             backend.write_item(ClipboardItem::Text(text))?;
             *last_local_hash.lock().unwrap() = payload_hash;
+            // The clipboard now holds remote content; drop any stale local
+            // payload so a reconnect doesn't push it back over the newer value.
+            *pending_local.lock().unwrap() = None;
             log::info!(
                 "applied remote text: source={}, size={}, hash={}",
                 message.source,
@@ -332,6 +376,7 @@ async fn apply_remote_message(
             let size = bytes.len();
             backend.write_item(ClipboardItem::ImagePng(bytes))?;
             *last_local_hash.lock().unwrap() = payload_hash;
+            *pending_local.lock().unwrap() = None;
             log::info!(
                 "applied remote image: source={}, size={}, hash={}",
                 message.source,

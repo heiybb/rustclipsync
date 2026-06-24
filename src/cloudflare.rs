@@ -10,6 +10,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
+/// How often we ping the relay to keep the connection warm.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// If we hear nothing back (data or pong) for this long, the connection is
+/// treated as dead even when the OS never surfaces an error. This catches the
+/// half-open case where Cloudflare recycles the relay/Durable Object without a
+/// clean reset: `read.next()` would otherwise block forever and the reconnect
+/// loop would never fire. Must comfortably exceed `PING_INTERVAL` so a healthy
+/// connection (which sees a pong every cycle) never trips it.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct CloudflareRelay {
     config: ClientConfig,
     http: Client,
@@ -17,10 +27,15 @@ pub struct CloudflareRelay {
 
 impl CloudflareRelay {
     pub fn new(config: ClientConfig) -> Self {
-        Self {
-            config,
-            http: Client::new(),
-        }
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            // Per-read timeout, not a total timeout: a stalled transfer errors
+            // out instead of hanging the receive loop forever, while a large
+            // but still-progressing object transfer is left alone.
+            .read_timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        Self { config, http }
     }
 
     pub async fn connect(
@@ -52,7 +67,7 @@ impl CloudflareRelay {
         let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
 
         tokio::spawn(async move {
-            let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
+            let mut ping_interval = tokio::time::interval(PING_INTERVAL);
             ping_interval.tick().await;
 
             loop {
@@ -85,9 +100,17 @@ impl CloudflareRelay {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    message = read.next() => {
+                    message = tokio::time::timeout(READ_IDLE_TIMEOUT, read.next()) => {
                         match message {
-                            Some(Ok(Message::Text(text))) => {
+                            Err(_elapsed) => {
+                                // No data or pong within the idle window: the
+                                // connection is half-open (e.g. relay recycled
+                                // without a clean reset). Drop it so the
+                                // reconnect loop can establish a fresh socket.
+                                log::info!("websocket idle timeout, treating connection as dead");
+                                break;
+                            }
+                            Ok(Some(Ok(Message::Text(text)))) => {
                                 match serde_json::from_str::<ServerWsMessage>(&text) {
                                     Ok(decoded) => {
                                         if in_tx.send(decoded).await.is_err() {
@@ -97,9 +120,9 @@ impl CloudflareRelay {
                                     Err(err) => log::warn!("failed to decode websocket message: {:?}", err),
                                 }
                             }
-                            Some(Ok(Message::Close(_))) => break,
-                            Some(Ok(_)) => {}
-                            Some(Err(err)) => {
+                            Ok(Some(Ok(Message::Close(_)))) => break,
+                            Ok(Some(Ok(_))) => {}
+                            Ok(Some(Err(err))) => {
                                 match &err {
                                     tokio_tungstenite::tungstenite::Error::ConnectionClosed => {
                                         log::info!("websocket connection closed by remote peer");
@@ -123,7 +146,7 @@ impl CloudflareRelay {
                                 }
                                 break;
                             }
-                            None => break,
+                            Ok(None) => break,
                         }
                     }
                     _ = &mut close_rx => {
