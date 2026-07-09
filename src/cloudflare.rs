@@ -10,14 +10,19 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
-/// How often we ping the relay to keep the connection warm.
+/// How often we ping the relay to keep the connection warm. This is an
+/// application-level text ping answered by the relay's auto-response pair,
+/// not a protocol-level ping frame: protocol pings can be answered by
+/// intermediaries (Cloudflare's edge) even when the Durable Object path is
+/// dead, so their pongs prove nothing about the relay itself.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
-/// If we hear nothing back (data or pong) for this long, the connection is
-/// treated as dead even when the OS never surfaces an error. This catches the
-/// half-open case where Cloudflare recycles the relay/Durable Object without a
-/// clean reset: `read.next()` would otherwise block forever and the reconnect
-/// loop would never fire. Must comfortably exceed `PING_INTERVAL` so a healthy
-/// connection (which sees a pong every cycle) never trips it.
+/// If no text frame (application data or the relay's pong) arrives for this
+/// long, the connection is treated as dead even when the OS never surfaces an
+/// error. This catches the half-open case where Cloudflare recycles the
+/// relay/Durable Object without a clean reset: `read.next()` would otherwise
+/// block forever and the reconnect loop would never fire. Must comfortably
+/// exceed `PING_INTERVAL` so a healthy connection (which sees a pong every
+/// cycle) never trips it.
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct CloudflareRelay {
@@ -51,6 +56,7 @@ impl CloudflareRelay {
             format!("Bearer {}", self.config.auth_token).parse()?,
         );
         let (socket, _) = connect_async(request).await?;
+        log::info!("websocket connected to relay");
         let (mut write, mut read) = socket.split();
         let (out_tx, mut out_rx) = mpsc::channel::<ClientWsMessage>(64);
         let (in_tx, in_rx) = mpsc::channel::<ServerWsMessage>(64);
@@ -88,7 +94,9 @@ impl CloudflareRelay {
                         }
                     }
                     _ = ping_interval.tick() => {
-                        if write.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                        let ping = serde_json::to_string(&ClientWsMessage::Ping)
+                            .expect("ping message serializes");
+                        if write.send(Message::Text(ping.into())).await.is_err() {
                             break;
                         }
                     }
@@ -98,20 +106,35 @@ impl CloudflareRelay {
         });
 
         tokio::spawn(async move {
+            // Only text frames (application data or the relay's pong) count
+            // as liveness. Protocol-level pongs are deliberately ignored:
+            // they can be produced by an intermediary while the relay path is
+            // dead, which would keep a half-open connection looking healthy
+            // forever.
+            let mut last_activity = tokio::time::Instant::now();
             loop {
+                let remaining = READ_IDLE_TIMEOUT
+                    .checked_sub(last_activity.elapsed())
+                    .unwrap_or(Duration::ZERO);
                 tokio::select! {
-                    message = tokio::time::timeout(READ_IDLE_TIMEOUT, read.next()) => {
+                    message = tokio::time::timeout(remaining, read.next()) => {
                         match message {
                             Err(_elapsed) => {
-                                // No data or pong within the idle window: the
-                                // connection is half-open (e.g. relay recycled
-                                // without a clean reset). Drop it so the
-                                // reconnect loop can establish a fresh socket.
-                                log::info!("websocket idle timeout, treating connection as dead");
+                                // No response from the relay within the idle
+                                // window: the connection is half-open (e.g.
+                                // relay recycled without a clean reset). Drop
+                                // it so the reconnect loop can establish a
+                                // fresh socket.
+                                log::warn!(
+                                    "no relay response for {}s, treating connection as dead",
+                                    READ_IDLE_TIMEOUT.as_secs()
+                                );
                                 break;
                             }
                             Ok(Some(Ok(Message::Text(text)))) => {
+                                last_activity = tokio::time::Instant::now();
                                 match serde_json::from_str::<ServerWsMessage>(&text) {
+                                    Ok(ServerWsMessage::Pong) => {}
                                     Ok(decoded) => {
                                         if in_tx.send(decoded).await.is_err() {
                                             break;
@@ -120,7 +143,10 @@ impl CloudflareRelay {
                                     Err(err) => log::warn!("failed to decode websocket message: {:?}", err),
                                 }
                             }
-                            Ok(Some(Ok(Message::Close(_)))) => break,
+                            Ok(Some(Ok(Message::Close(_)))) => {
+                                log::info!("websocket closed by relay");
+                                break;
+                            }
                             Ok(Some(Ok(_))) => {}
                             Ok(Some(Err(err))) => {
                                 match &err {
@@ -146,7 +172,10 @@ impl CloudflareRelay {
                                 }
                                 break;
                             }
-                            Ok(None) => break,
+                            Ok(None) => {
+                                log::info!("websocket stream ended");
+                                break;
+                            }
                         }
                     }
                     _ = &mut close_rx => {

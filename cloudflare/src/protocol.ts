@@ -5,6 +5,7 @@ export const DEFAULT_ROOM = "default";
 export type PayloadKind = "text" | "image_png" | "file";
 
 export type ClientMessage =
+  | { type: "ping" }
   | {
       type: "hello";
       client_id: string;
@@ -45,6 +46,7 @@ export type RelayMessage = {
 };
 
 export type ServerMessage =
+  | { type: "pong" }
   | { type: "hello_ack"; latest_sequence: number }
   | ({ type: "message" } & RelayMessage)
   | { type: "error"; message: string };
@@ -55,6 +57,10 @@ export function isValidClientMessage(value: unknown): value is ClientMessage {
   }
 
   const message = value as Record<string, unknown>;
+  if (message.type === "ping") {
+    return true;
+  }
+
   if (message.type === "hello") {
     return (
       typeof message.client_id === "string" &&

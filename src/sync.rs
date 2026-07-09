@@ -76,9 +76,14 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
         last_local_hash.clone(),
     ));
 
+    const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(2);
+    const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(60);
+    let mut reconnect_delay = RECONNECT_DELAY_MIN;
+
     loop {
         match relay.connect(last_seen_sequence).await {
             Ok((outgoing, incoming)) => {
+                reconnect_delay = RECONNECT_DELAY_MIN;
                 let forwarder_fut = async {
                     // Drop a wake queued while we were disconnected: the
                     // send_pending below already covers the latest payload, so
@@ -105,13 +110,15 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 
                 tokio::select! {
                     res = forwarder_fut => {
-                        if let Err(err) = res {
-                            log::warn!("local forwarder failed: {:?}", err);
+                        match res {
+                            Err(err) => log::warn!("local forwarder failed: {:?}", err),
+                            Ok(()) => log::info!("relay connection lost (send path closed), reconnecting"),
                         }
                     }
                     res = receiver_fut => {
-                        if let Err(err) = res {
-                            log::warn!("remote receiver failed: {:?}", err);
+                        match res {
+                            Err(err) => log::warn!("remote receiver failed: {:?}", err),
+                            Ok(()) => log::info!("relay connection lost (receive path closed), reconnecting"),
                         }
                     }
                     res = &mut local_send_task => {
@@ -124,10 +131,18 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
                     }
                 }
             }
-            Err(err) => log::warn!("websocket connect failed: {:?}", err),
+            Err(err) => log::warn!(
+                "websocket connect failed (retrying in {}s): {:?}",
+                reconnect_delay.as_secs(),
+                err
+            ),
         }
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(reconnect_delay).await;
+        // Back off while connects keep failing (e.g. relay quota exhausted)
+        // so the retry loop doesn't burn requests every 2s all day; reset on
+        // the next successful connection.
+        reconnect_delay = (reconnect_delay * 2).min(RECONNECT_DELAY_MAX);
     }
 
     local_send_task.abort();
@@ -266,7 +281,9 @@ async fn remote_receive_loop(
 ) -> Result<()> {
     while let Some(message) = incoming.recv().await {
         match message {
+            ServerWsMessage::Pong => {}
             ServerWsMessage::HelloAck { latest_sequence } => {
+                log::info!("relay hello acknowledged: latest_sequence={latest_sequence}");
                 *last_seen_sequence = latest_sequence;
             }
             ServerWsMessage::Error { message } => {

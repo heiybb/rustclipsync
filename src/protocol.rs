@@ -11,6 +11,10 @@ pub enum PayloadKind {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientWsMessage {
+    /// Application-level heartbeat. Serialization must stay byte-identical to
+    /// the relay's WebSocketRequestResponsePair request string so the
+    /// Cloudflare runtime can answer it without waking the Durable Object.
+    Ping,
     Hello {
         client_id: String,
         client_name: String,
@@ -39,6 +43,7 @@ pub enum ClientWsMessage {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerWsMessage {
+    Pong,
     HelloAck { latest_sequence: u64 },
     Message(RelayMessage),
     Error { message: String },
@@ -82,6 +87,24 @@ impl PayloadKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ping_serializes_to_exact_auto_response_request() {
+        // Must match the relay's WebSocketRequestResponsePair request string
+        // byte for byte, or the runtime auto-response never fires.
+        assert_eq!(
+            serde_json::to_string(&ClientWsMessage::Ping).unwrap(),
+            r#"{"type":"ping"}"#
+        );
+    }
+
+    #[test]
+    fn pong_deserializes_from_auto_response_reply() {
+        assert_eq!(
+            serde_json::from_str::<ServerWsMessage>(r#"{"type":"pong"}"#).unwrap(),
+            ServerWsMessage::Pong
+        );
+    }
 
     #[test]
     fn client_ws_message_uses_snake_case_type_tag() {
