@@ -11,15 +11,10 @@ pub struct Config {
     pub client_name: Option<String>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
-    #[serde(default = "default_receive_dir")]
-    pub receive_dir: String,
 }
 
 fn default_poll_interval() -> u64 {
     300
-}
-fn default_receive_dir() -> String {
-    "receive".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +24,6 @@ pub struct ClientConfig {
     pub client_name: String,
     pub auth_token: String,
     pub poll_interval_ms: u64,
-    pub receive_dir: String,
     pub max_payload_bytes: usize,
 }
 
@@ -57,7 +51,6 @@ pub fn load_config() -> Result<ClientConfig> {
         client_name,
         auth_token: config.auth_token,
         poll_interval_ms: config.poll_interval_ms,
-        receive_dir: config.receive_dir,
         max_payload_bytes: R2_PAYLOAD_LIMIT_BYTES,
     })
 }
@@ -72,9 +65,6 @@ auth_token = "your-secret-token"
 
 # Optional: How often to poll local clipboard in ms
 # poll_interval_ms = 300
-
-# Optional: Where to save received files
-# receive_dir = "receive"
 "#;
     fs::write(path, example).with_context(|| "Failed to create default config.toml")
 }

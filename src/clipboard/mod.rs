@@ -1,7 +1,6 @@
 use anyhow::Result;
 use image::{ImageBuffer, ImageFormat, RgbaImage};
 use std::io::Cursor;
-use std::path::PathBuf;
 
 #[cfg(any(not(windows), test))]
 #[cfg_attr(all(test, windows), allow(dead_code))]
@@ -15,7 +14,6 @@ mod windows;
 pub enum ClipboardItem {
     Text(String),
     ImagePng(Vec<u8>),
-    FilePath(PathBuf),
 }
 
 pub trait ClipboardBackend: Send {

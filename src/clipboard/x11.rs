@@ -74,7 +74,6 @@ impl ClipboardBackend for X11Backend {
         match item {
             ClipboardItem::Text(text) => Self::write_target("text/plain", text.as_bytes()),
             ClipboardItem::ImagePng(bytes) => Self::write_target("image/png", &bytes),
-            ClipboardItem::FilePath(_) => Ok(()),
         }
     }
 }

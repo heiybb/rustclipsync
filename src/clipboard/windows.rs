@@ -4,9 +4,7 @@ use super::{
 };
 use anyhow::Result;
 use arboard::Clipboard;
-use clipboard_win::{Clipboard as WinClipboard, Getter, formats::FileList};
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use clipboard_win::Clipboard as WinClipboard;
 use std::sync::mpsc;
 use std::thread;
 use windows_sys::Win32::System::DataExchange::{
@@ -18,8 +16,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 pub struct WindowsBackend {
     clipboard: Clipboard,
     last_text: String,
-    last_files: Vec<PathBuf>,
-    pending_files: VecDeque<PathBuf>,
     last_image_hash: String,
 }
 
@@ -36,8 +32,6 @@ impl WindowsBackend {
         Ok(Self {
             clipboard: Clipboard::new()?,
             last_text: String::new(),
-            last_files: Vec::new(),
-            pending_files: VecDeque::new(),
             last_image_hash: String::new(),
         })
     }
@@ -46,16 +40,6 @@ impl WindowsBackend {
         let backend = Self::new()?;
         let watcher = WindowsWatcher::new()?;
         Ok((backend, watcher))
-    }
-
-    fn read_file_list() -> Result<Vec<PathBuf>> {
-        let _clip = WinClipboard::new_attempts(10)
-            .map_err(|e| anyhow::anyhow!("windows clipboard lock error: {:?}", e))?;
-        let mut paths = Vec::<PathBuf>::new();
-        FileList
-            .read_clipboard(&mut paths)
-            .map_err(|e| anyhow::anyhow!("windows file list read error: {:?}", e))?;
-        Ok(paths)
     }
 }
 
@@ -142,26 +126,11 @@ impl ClipboardBackend for WindowsBackend {
     }
 
     fn read_snapshot(&mut self) -> Result<Option<ClipboardItem>> {
-        if let Some(path) = self.pending_files.pop_front() {
-            return Ok(Some(ClipboardItem::FilePath(path)));
-        }
-
         if let Ok(text) = self.clipboard.get_text()
             && text != self.last_text
         {
             self.last_text = text.clone();
             return Ok(Some(ClipboardItem::Text(text)));
-        }
-
-        if let Ok(paths) = Self::read_file_list()
-            && !paths.is_empty()
-            && paths != self.last_files
-        {
-            self.last_files = paths.clone();
-            self.pending_files = paths.into_iter().collect();
-            if let Some(path) = self.pending_files.pop_front() {
-                return Ok(Some(ClipboardItem::FilePath(path)));
-            }
         }
 
         // Try custom "PNG" format first to preserve transparency and avoid quality loss.
@@ -253,7 +222,6 @@ impl ClipboardBackend for WindowsBackend {
                 mark_current_text_seen(&mut self.last_text, self.clipboard.get_text());
                 Ok(())
             }
-            ClipboardItem::FilePath(_) => Ok(()),
         }
     }
 }

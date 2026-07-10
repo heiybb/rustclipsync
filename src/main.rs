@@ -1,7 +1,6 @@
 mod clipboard;
 mod cloudflare;
 mod config;
-mod file_transfer;
 mod protocol;
 mod security;
 mod sync;

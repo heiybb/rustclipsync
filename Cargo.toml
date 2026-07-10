@@ -27,9 +27,6 @@ bytes = "1"
 clipboard-win = "5.4.1"
 windows-sys = { version = "0.59", features = ["Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }
 
-[dev-dependencies]
-filetime = "0.2"
-
 [profile.release]
 # 告诉编译器优化查找速度的同时尽量减小体积
 opt-level = 'z'

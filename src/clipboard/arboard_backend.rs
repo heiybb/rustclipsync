@@ -67,7 +67,6 @@ impl ClipboardBackend for ArboardBackend {
                 mark_current_text_seen(&mut self.last_text, self.clipboard.get_text());
                 Ok(())
             }
-            ClipboardItem::FilePath(_) => Ok(()),
         }
     }
 }

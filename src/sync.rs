@@ -1,20 +1,16 @@
 use crate::clipboard::{ClipboardBackend, ClipboardItem, ClipboardWatcher, create_backend};
 use crate::cloudflare::CloudflareRelay;
 use crate::config::ClientConfig;
-use crate::file_transfer::{cleanup_old_received_files, save_received_file};
 use crate::protocol::{ClientWsMessage, PayloadKind, RelayMessage, RelayPayload, ServerWsMessage};
 use crate::security::calculate_bytes_hash;
 use anyhow::Result;
 use base64::Engine;
 use base64::prelude::*;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-const RECEIVE_FILE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
-const RECEIVE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub const INLINE_PAYLOAD_LIMIT_BYTES: usize = 10 * 1024;
 pub const R2_PAYLOAD_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 
@@ -36,11 +32,10 @@ pub struct LocalPayload {
 
 pub async fn run_client(config: ClientConfig) -> Result<()> {
     log::info!(
-        "client starting: id={}, name={}, relay={}, receive_dir={}, local_poll_ms={}, max_inline_bytes={}, max_r2_bytes={}",
+        "client starting: id={}, name={}, relay={}, local_poll_ms={}, max_inline_bytes={}, max_r2_bytes={}",
         config.client_id,
         config.client_name,
         config.server_url,
-        config.receive_dir,
         config.poll_interval_ms,
         INLINE_PAYLOAD_LIMIT_BYTES,
         config.max_payload_bytes
@@ -59,8 +54,6 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     // (re)connect so content that was in flight when a connection dropped is
     // not silently lost; cleared when remote content replaces the clipboard.
     let pending_local: Arc<Mutex<Option<Arc<LocalPayload>>>> = Arc::new(Mutex::new(None));
-    let _receive_cleanup_task =
-        tokio::spawn(receive_cleanup_loop(PathBuf::from(&config.receive_dir)));
     let relay = Arc::new(CloudflareRelay::new(config.clone()));
     let mut last_seen_sequence = 0;
 
@@ -150,24 +143,6 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     #[allow(unreachable_code)]
     {
         Ok(())
-    }
-}
-
-async fn receive_cleanup_loop(receive_dir: PathBuf) {
-    loop {
-        match cleanup_old_received_files(&receive_dir, RECEIVE_FILE_RETENTION, SystemTime::now()) {
-            Ok(removed) if removed > 0 => {
-                log::info!(
-                    "cleaned old received files: dir={}, removed={}",
-                    receive_dir.display(),
-                    removed
-                );
-            }
-            Ok(_) => {}
-            Err(err) => log::warn!("receive cleanup failed: {:?}", err),
-        }
-
-        tokio::time::sleep(RECEIVE_CLEANUP_INTERVAL).await;
     }
 }
 
@@ -314,22 +289,6 @@ pub fn local_payload_for_item(
     let (kind, filename, bytes) = match item {
         ClipboardItem::Text(text) => (PayloadKind::Text, None, text.into_bytes()),
         ClipboardItem::ImagePng(bytes) => (PayloadKind::ImagePng, None, bytes),
-        ClipboardItem::FilePath(path) => {
-            if !path.is_file() {
-                return Ok(None);
-            }
-            let metadata = std::fs::metadata(&path)?;
-            if metadata.len() > R2_PAYLOAD_LIMIT_BYTES as u64 {
-                log::warn!("file ignored because it exceeds Cloudflare R2 payload limit");
-                return Ok(None);
-            }
-            let bytes = std::fs::read(&path)?;
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string);
-            (PayloadKind::File, filename, bytes)
-        }
     };
 
     if bytes.len() > R2_PAYLOAD_LIMIT_BYTES {
@@ -363,6 +322,17 @@ async fn apply_remote_message(
     pending_local: &Arc<Mutex<Option<Arc<LocalPayload>>>>,
 ) -> Result<()> {
     if message.source == config.client_id {
+        return Ok(());
+    }
+
+    // File sync has been removed; older clients may still publish files, so
+    // drop them here before wasting a download on the payload.
+    if message.kind == PayloadKind::File {
+        log::info!(
+            "ignoring remote file (file sync disabled): source={}, filename={:?}",
+            message.source,
+            message.filename
+        );
         return Ok(());
     }
 
@@ -401,19 +371,8 @@ async fn apply_remote_message(
                 hash_prefix(&message.payload_hash)
             );
         }
-        PayloadKind::File => {
-            let filename = message
-                .filename
-                .ok_or_else(|| anyhow::anyhow!("missing filename"))?;
-            let path = save_received_file(Path::new(&config.receive_dir), &filename, &bytes)?;
-            log::info!(
-                "saved remote file: source={}, path={}, size={}, hash={}",
-                message.source,
-                path.display(),
-                bytes.len(),
-                hash_prefix(&message.payload_hash)
-            );
-        }
+        // Filtered out before download; unreachable here.
+        PayloadKind::File => {}
     }
 
     Ok(())
@@ -479,48 +438,36 @@ mod tests {
     }
 
     #[test]
-    fn hundred_kb_file_uses_inline_route() {
-        let (_root, file_path) = sparse_test_file(INLINE_PAYLOAD_LIMIT_BYTES as u64);
+    fn payload_at_inline_limit_uses_inline_route() {
         let config = test_config();
-        let payload = local_payload_for_item(&config, ClipboardItem::FilePath(file_path))
+        let text = "a".repeat(INLINE_PAYLOAD_LIMIT_BYTES);
+        let payload = local_payload_for_item(&config, ClipboardItem::Text(text))
             .unwrap()
             .unwrap();
 
-        assert_eq!(payload.kind, PayloadKind::File);
-        assert_eq!(payload.filename.as_deref(), Some("sample.bin"));
+        assert_eq!(payload.kind, PayloadKind::Text);
         assert_eq!(payload.bytes.len(), INLINE_PAYLOAD_LIMIT_BYTES);
         assert_eq!(payload.route, OutgoingPayloadRoute::Inline);
     }
 
     #[test]
-    fn file_above_hundred_kb_uses_r2_route() {
-        let (_root, file_path) = sparse_test_file((INLINE_PAYLOAD_LIMIT_BYTES + 1) as u64);
+    fn payload_above_inline_limit_uses_r2_route() {
         let config = test_config();
-        let payload = local_payload_for_item(&config, ClipboardItem::FilePath(file_path))
+        let bytes = vec![0u8; INLINE_PAYLOAD_LIMIT_BYTES + 1];
+        let payload = local_payload_for_item(&config, ClipboardItem::ImagePng(bytes))
             .unwrap()
             .unwrap();
 
-        assert_eq!(payload.kind, PayloadKind::File);
+        assert_eq!(payload.kind, PayloadKind::ImagePng);
         assert_eq!(payload.bytes.len(), INLINE_PAYLOAD_LIMIT_BYTES + 1);
         assert_eq!(payload.route, OutgoingPayloadRoute::R2);
     }
 
     #[test]
-    fn file_above_one_hundred_mb_is_rejected() {
-        let (_root, file_path) = sparse_test_file((R2_PAYLOAD_LIMIT_BYTES + 1) as u64);
+    fn payload_above_r2_limit_is_rejected() {
         let config = test_config();
-        let payload = local_payload_for_item(&config, ClipboardItem::FilePath(file_path)).unwrap();
-
-        assert!(payload.is_none());
-    }
-
-    #[test]
-    fn missing_file_path_returns_none() {
-        let config = test_config();
-        let missing_path =
-            std::env::temp_dir().join(format!("rustclipsync-missing-{}", Uuid::new_v4()));
-        let payload =
-            local_payload_for_item(&config, ClipboardItem::FilePath(missing_path)).unwrap();
+        let bytes = vec![0u8; R2_PAYLOAD_LIMIT_BYTES + 1];
+        let payload = local_payload_for_item(&config, ClipboardItem::ImagePng(bytes)).unwrap();
 
         assert!(payload.is_none());
     }
@@ -568,17 +515,7 @@ mod tests {
             client_name: "Client A".to_string(),
             auth_token: "secret".to_string(),
             poll_interval_ms: 300,
-            receive_dir: "receive".to_string(),
             max_payload_bytes: R2_PAYLOAD_LIMIT_BYTES,
         }
-    }
-
-    fn sparse_test_file(len: u64) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("rustclipsync-local-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let file_path = root.join("sample.bin");
-        let file = std::fs::File::create(&file_path).unwrap();
-        file.set_len(len).unwrap();
-        (root, file_path)
     }
 }
