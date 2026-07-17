@@ -24,6 +24,18 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// exceed `PING_INTERVAL` so a healthy connection (which sees a pong every
 /// cycle) never trips it.
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on establishing the websocket (TCP + TLS + upgrade) plus the
+/// initial hello write. `connect_async` has no timeout of its own and the
+/// socket has no keepalive, so a handshake that lands in a network outage
+/// window (overnight PPPoE re-dial, NAT reset, suspend/resume) would
+/// otherwise hang `connect()` — and with it the whole reconnect loop —
+/// forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bound on a single websocket write. A half-open socket accepts
+/// writes until the kernel send buffer fills, then blocks the writer task
+/// indefinitely; treating a stalled write as a dead connection lets the
+/// reconnect loop recover instead.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct CloudflareRelay {
     config: ClientConfig,
@@ -55,7 +67,14 @@ impl CloudflareRelay {
             AUTHORIZATION,
             format!("Bearer {}", self.config.auth_token).parse()?,
         );
-        let (socket, _) = connect_async(request).await?;
+        let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "websocket connect timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })??;
         log::info!("websocket connected to relay");
         let (mut write, mut read) = socket.split();
         let (out_tx, mut out_rx) = mpsc::channel::<ClientWsMessage>(64);
@@ -66,9 +85,17 @@ impl CloudflareRelay {
             client_name: self.config.client_name.clone(),
             last_seen_sequence,
         };
-        write
-            .send(Message::Text(serde_json::to_string(&hello)?.into()))
-            .await?;
+        tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            write.send(Message::Text(serde_json::to_string(&hello)?.into())),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "hello send timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })??;
 
         let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -83,7 +110,7 @@ impl CloudflareRelay {
                             Some(message) => {
                                 match serde_json::to_string(&message) {
                                     Ok(json) => {
-                                        if write.send(Message::Text(json.into())).await.is_err() {
+                                        if !send_or_give_up(&mut write, json).await {
                                             break;
                                         }
                                     }
@@ -96,7 +123,7 @@ impl CloudflareRelay {
                     _ = ping_interval.tick() => {
                         let ping = serde_json::to_string(&ClientWsMessage::Ping)
                             .expect("ping message serializes");
-                        if write.send(Message::Text(ping.into())).await.is_err() {
+                        if !send_or_give_up(&mut write, ping).await {
                             break;
                         }
                     }
@@ -136,8 +163,22 @@ impl CloudflareRelay {
                                 match serde_json::from_str::<ServerWsMessage>(&text) {
                                     Ok(ServerWsMessage::Pong) => {}
                                     Ok(decoded) => {
-                                        if in_tx.send(decoded).await.is_err() {
-                                            break;
+                                        // A bounded send that blocks here (receiver
+                                        // wedged on a clipboard call, channel full)
+                                        // would sit outside the select and disarm
+                                        // the idle watchdog above. Give up instead:
+                                        // the reconnect's hello/catch-up re-delivers
+                                        // the latest message.
+                                        match tokio::time::timeout(READ_IDLE_TIMEOUT, in_tx.send(decoded)).await {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(_)) => break,
+                                            Err(_elapsed) => {
+                                                log::warn!(
+                                                    "receive pipeline stalled for {}s, treating connection as dead",
+                                                    READ_IDLE_TIMEOUT.as_secs()
+                                                );
+                                                break;
+                                            }
                                         }
                                     }
                                     Err(err) => log::warn!("failed to decode websocket message: {:?}", err),
@@ -292,6 +333,25 @@ impl CloudflareRelay {
         println!();
 
         Ok(buffer)
+    }
+}
+
+/// Sends one text frame, bailing out after `SEND_TIMEOUT`. Returns false when
+/// the connection should be torn down (write error or stall).
+async fn send_or_give_up<S>(write: &mut S, json: String) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    match tokio::time::timeout(SEND_TIMEOUT, write.send(Message::Text(json.into()))).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_elapsed) => {
+            log::warn!(
+                "websocket send stalled for {}s, treating connection as dead",
+                SEND_TIMEOUT.as_secs()
+            );
+            false
+        }
     }
 }
 
