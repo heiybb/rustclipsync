@@ -1,0 +1,13 @@
+// Windows resource script for the tray GUI binary.
+//
+// Resource id 1 matters twice over:
+//   * Explorer, the taskbar and Alt-Tab show the lowest-numbered RT_GROUP_ICON
+//     as the executable's icon, and gpui registers its window class with a null
+//     hIcon, so this is what the window inherits.
+//   * `tray::build` loads the same id through `Icon::from_resource`, which lets
+//     Windows pick the entry matching the notification area's icon size instead
+//     of rescaling a single bitmap.
+//
+// Keep the icon multi-resolution (16/20/24/32/48/64/128/256) so that choice has
+// something to pick from at every DPI scaling factor.
+1 ICON "rustclipsync.ico"

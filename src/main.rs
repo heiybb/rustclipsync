@@ -1,16 +1,12 @@
-mod clipboard;
-mod cloudflare;
-mod config;
-mod protocol;
-mod security;
-mod sync;
-
-use crate::config::load_config;
-use crate::sync::run_client;
+use rustclipsync::config::load_config;
+use rustclipsync::logging::{self, ConsoleTarget};
+use rustclipsync::sync::run_client;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // No in-memory buffer: on the console there is nothing to scroll back
+    // through it, and retaining records would just cost memory.
+    logging::init(ConsoleTarget::Stderr, None)?;
 
     run_client(load_config()?).await?;
 

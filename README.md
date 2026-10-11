@@ -33,8 +33,10 @@ Local clipboard changes are detected by platform-specific watchers where availab
 
 ```text
 cloudflare/      Cloudflare Worker, Durable Object, R2 endpoints, tests
-src/             Rust desktop client
-config.toml      Example client configuration
+src/             Rust desktop client (library + CLI binary)
+src/gui/         Windows tray GUI: gpui log window and tray icon (feature `gui`)
+assets/          Application icon and the resource script that embeds it
+build.rs         Attaches assets/rustclipsync.rc to the GUI binary only
 ```
 
 ## Build The Client
@@ -52,6 +54,44 @@ target/release/rustclipsync
 target\release\rustclipsync.exe
 ```
 
+### Tray GUI (Windows)
+
+The GUI front end sits behind the `gui` feature, so the default build stays
+small and free of UI dependencies:
+
+```powershell
+cargo build --release --features gui
+```
+
+Output: `target\release\rustclipsync-gui.exe`.
+
+Requirements: Windows, plus `fxc.exe` from the Windows 10/11 SDK either on
+`PATH`, at the SDK's default location, or pointed at by `GPUI_FXC_PATH`.
+Release builds of `gpui` compile their HLSL shaders ahead of time; debug builds
+compile them at runtime and need no SDK.
+
+#### Application icon
+
+`build.rs` embeds `assets/rustclipsync.ico` into `rustclipsync-gui.exe` as
+resource id 1, which serves as both the executable icon (Explorer, taskbar,
+Alt-Tab) and the notification-area icon. To change it, replace that one file.
+
+Keep it multi-resolution. The tray asks Windows for the exact size the
+notification area wants at the current DPI — 16, 20, 24 or 32 px as the display
+scaling factor rises — so an icon holding those entries is used verbatim
+instead of being resampled. A test asserts they are present.
+
+Crop the transparent padding out first. Icon generators tend to leave a wide
+margin around the glyph, which is invisible to every other check — the file
+parses, the sizes are all there, the resource embeds, the tray loads it — and
+the icon still renders visibly smaller than its neighbours in the notification
+area, because the drawn pixels only occupy the middle of each canvas. The glyph
+should reach the canvas edge on its longer axis; a test measures the alpha
+channel and fails with the actual fill percentages if it does not.
+
+The CLI binary deliberately gets no icon: the resource is attached per-binary,
+so `rustclipsync.exe` does not carry 64 KB it would never display.
+
 ## Deploy The Cloudflare Relay
 
 Install Node.js and pnpm, then deploy the Worker:
@@ -61,8 +101,13 @@ cd cloudflare
 pnpm install
 pnpm wrangler r2 bucket create rustclipsync-objects
 pnpm wrangler secret put AUTH_TOKEN
-pnpm deploy
+pnpm deploy --domain relay.example.com
 ```
+
+`wrangler.toml` turns off the `*.workers.dev` and preview URLs, so the Worker is
+only reachable through the custom domain passed with `--domain`. The domain must
+be a zone on the same Cloudflare account. To use `workers.dev` instead, set
+`workers_dev = true` and deploy without `--domain`.
 
 The Worker uses:
 
@@ -74,7 +119,7 @@ The Worker uses:
 Health check:
 
 ```bash
-curl https://YOUR_WORKER.workers.dev/health
+curl https://relay.example.com/health
 ```
 
 Expected response:
@@ -90,7 +135,7 @@ Run the client once. If `config.toml` does not exist, RustClipSync creates a tem
 Example:
 
 ```toml
-server_url = "https://YOUR_WORKER.workers.dev"
+server_url = "https://relay.example.com"
 auth_token = "YOUR_TOKEN"
 
 # Optional: Custom name for this device. Defaults to hostname.
@@ -122,6 +167,33 @@ sudo apt install -y xclip
 ```
 
 Use a different hostname or `client_name` for each trusted device.
+
+### Tray GUI
+
+`rustclipsync-gui.exe` runs the same sync client with no console window and
+puts an icon in the notification area:
+
+- **Left click** the icon: show the log window, or hide it if it is already up.
+- **Right click**: show the log window, reload `config.toml` and restart sync,
+  or quit.
+- Closing the log window, or pressing `Esc` in it, only hides it. Sync keeps
+  running; quit from the tray menu.
+
+The window shows the same records the CLI writes to stderr, honours `RUST_LOG`,
+and retains the last 4000 of them. Its toolbar sets a minimum level, toggles
+follow-tail, and clears the buffer. The coloured dot and the tray tooltip show
+the relay connection state.
+
+Pass `--hidden` to start without opening the window, which is what a
+startup-folder shortcut wants:
+
+```powershell
+.\rustclipsync-gui.exe --hidden
+```
+
+`config.toml` is looked up in `$RUSTCLIPSYNC_CONFIG`, then the working
+directory, then next to the executable. The last one matters for shortcuts,
+whose working directory is usually not the install directory.
 
 ## Payload Rules
 

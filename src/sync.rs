@@ -3,6 +3,7 @@ use crate::cloudflare::CloudflareRelay;
 use crate::config::ClientConfig;
 use crate::protocol::{ClientWsMessage, PayloadKind, RelayMessage, RelayPayload, ServerWsMessage};
 use crate::security::calculate_bytes_hash;
+use crate::status::{SyncState, SyncStatus};
 use anyhow::Result;
 use base64::Engine;
 use base64::prelude::*;
@@ -31,6 +32,12 @@ pub struct LocalPayload {
 }
 
 pub async fn run_client(config: ClientConfig) -> Result<()> {
+    run_client_with_status(config, SyncStatus::new()).await
+}
+
+/// Same as [`run_client`], but reports connection state into `status` so a UI
+/// can display it.
+pub async fn run_client_with_status(config: ClientConfig, status: Arc<SyncStatus>) -> Result<()> {
     log::info!(
         "client starting: id={}, name={}, relay={}, local_poll_ms={}, max_inline_bytes={}, max_r2_bytes={}",
         config.client_id,
@@ -74,9 +81,11 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
     let mut reconnect_delay = RECONNECT_DELAY_MIN;
 
     loop {
+        status.set(SyncState::Connecting, config.server_url.clone());
         match relay.connect(last_seen_sequence).await {
             Ok((outgoing, incoming)) => {
                 reconnect_delay = RECONNECT_DELAY_MIN;
+                status.set(SyncState::Connected, config.server_url.clone());
                 let forwarder_fut = async {
                     // Drop a wake queued while we were disconnected: the
                     // send_pending below already covers the latest payload, so
@@ -116,9 +125,18 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
                     }
                     res = &mut local_send_task => {
                         match res {
-                            Ok(Ok(())) => log::info!("local send task exited normally"),
-                            Ok(Err(err)) => log::error!("local send task failed: {:?}", err),
-                            Err(err) => log::error!("local send task panicked: {:?}", err),
+                            Ok(Ok(())) => {
+                                log::info!("local send task exited normally");
+                                status.set(SyncState::Failed, "本地剪贴板监听已退出");
+                            }
+                            Ok(Err(err)) => {
+                                log::error!("local send task failed: {:?}", err);
+                                status.set(SyncState::Failed, format!("本地剪贴板监听失败: {err}"));
+                            }
+                            Err(err) => {
+                                log::error!("local send task panicked: {:?}", err);
+                                status.set(SyncState::Failed, format!("本地剪贴板监听 panic: {err}"));
+                            }
                         }
                         break;
                     }
@@ -131,6 +149,10 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
             ),
         }
 
+        status.set(
+            SyncState::Retrying,
+            format!("{}s 后重试", reconnect_delay.as_secs()),
+        );
         tokio::time::sleep(reconnect_delay).await;
         // Back off while connects keep failing (e.g. relay quota exhausted)
         // so the retry loop doesn't burn requests every 2s all day; reset on

@@ -1,0 +1,7 @@
+# This repository is cloned with core.autocrlf enabled, so text files get their
+# line endings rewritten on checkout. An icon that goes through that rewrite is
+# a corrupt resource which still compiles and still links -- it just renders as
+# nothing -- so mark binary assets explicitly rather than trusting git's
+# content heuristics to spot them.
+*.ico binary
+*.png binary

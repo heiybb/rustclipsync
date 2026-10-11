@@ -3,6 +3,31 @@ name = "rustclipsync"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rustclipsync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustclipsync"
+path = "src/main.rs"
+
+# Tray-resident GUI front end. Windows only for now: it drives a win32 message
+# loop directly and the tray/window plumbing is not implemented for X11/Wayland.
+[[bin]]
+name = "rustclipsync-gui"
+path = "src/bin/rustclipsync-gui.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = ["dep:gpui", "dep:tray-icon", "dep:raw-window-handle", "dep:embed-resource"]
+
+# Only used by build.rs, and only to attach assets/rustclipsync.rc to the GUI
+# binary. Not target-gated: build dependencies are compiled for the host, and
+# build.rs decides what to do from CARGO_CFG_TARGET_OS instead.
+[build-dependencies]
+embed-resource = { version = "3", optional = true }
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
@@ -25,7 +50,12 @@ bytes = "1"
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
-windows-sys = { version = "0.59", features = ["Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }
+windows-sys = { version = "0.59", features = ["Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_System_SystemInformation"] }
+# GUI-only. `raw-window-handle` must stay pinned to the major version gpui uses,
+# otherwise the handle types don't line up.
+gpui = { version = "0.2", optional = true }
+tray-icon = { version = "0.24", optional = true, default-features = false }
+raw-window-handle = { version = "0.6", optional = true }
 
 [profile.release]
 # 告诉编译器优化查找速度的同时尽量减小体积
@@ -39,3 +69,11 @@ lto = true
 
 # 直接剥离符号表（移除调试信息），这一步对体积影响极大
 strip = true
+
+# gpui 是 GPU 渲染框架，用 opt-level='z' 编译会明显拖慢界面；
+# 只给它和它的渲染依赖开速度优化，本 crate 仍保持体积优先。
+[profile.release.package.gpui]
+opt-level = 2
+
+[profile.release.package.taffy]
+opt-level = 2

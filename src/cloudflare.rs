@@ -90,12 +90,7 @@ impl CloudflareRelay {
             write.send(Message::Text(serde_json::to_string(&hello)?.into())),
         )
         .await
-        .map_err(|_| {
-            anyhow!(
-                "hello send timed out after {}s",
-                CONNECT_TIMEOUT.as_secs()
-            )
-        })??;
+        .map_err(|_| anyhow!("hello send timed out after {}s", CONNECT_TIMEOUT.as_secs()))??;
 
         let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -239,8 +234,8 @@ impl CloudflareRelay {
         let total_size = bytes.len() as u64;
         let bytes_data = bytes::Bytes::from(bytes);
 
-        use indicatif::{ProgressBar, ProgressStyle};
-        let pb = ProgressBar::new(total_size);
+        use indicatif::ProgressStyle;
+        let pb = new_progress_bar(total_size);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} Uploading [{elapsed_precise}] [{bar:40.magenta/blue}] {bytes}/{total_bytes} ({eta})")?
@@ -277,7 +272,9 @@ impl CloudflareRelay {
                 .progress_chars("#>-"),
         );
         pb.finish();
-        println!();
+        if crate::logging::console_progress() {
+            println!();
+        }
 
         response
             .get("object_key")
@@ -309,9 +306,9 @@ impl CloudflareRelay {
         let mut stream = response.bytes_stream();
 
         let _display_name = filename.unwrap_or("unnamed file");
-        use indicatif::{ProgressBar, ProgressStyle};
+        use indicatif::ProgressStyle;
 
-        let pb = ProgressBar::new(total_size);
+        let pb = new_progress_bar(total_size);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
@@ -330,7 +327,9 @@ impl CloudflareRelay {
                 .progress_chars("#>-"),
             );
         pb.finish();
-        println!();
+        if crate::logging::console_progress() {
+            println!();
+        }
 
         Ok(buffer)
     }
@@ -377,6 +376,19 @@ fn object_endpoint(server_url: &str, message_id: &str, filename: Option<&str>) -
         url.push_str(&urlencoding::encode(filename));
     }
     Ok(url)
+}
+
+/// A transfer progress bar, or an inert one when nothing is watching.
+///
+/// `indicatif` draws to stderr, which does not exist in the GUI binary. A
+/// hidden bar keeps the call sites free of branching while making every draw a
+/// no-op.
+fn new_progress_bar(total_size: u64) -> indicatif::ProgressBar {
+    if crate::logging::console_progress() {
+        indicatif::ProgressBar::new(total_size)
+    } else {
+        indicatif::ProgressBar::hidden()
+    }
 }
 
 #[cfg(test)]
