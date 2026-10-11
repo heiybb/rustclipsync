@@ -8,3 +8,5 @@ receive/
 build_error.txt
 .env
 .env.*
+# Holds the real auth_token. The client writes a template on first run.
+config.toml
