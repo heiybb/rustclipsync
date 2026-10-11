@@ -12,6 +12,24 @@ use std::time::{Duration, Instant};
 /// kill the child after this long and treat the attempt as failed instead.
 const XCLIP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Text targets to read, best first. `UTF8_STRING` is what xclip asks for when
+/// no `-t` is given, and what arboard-based apps (snip and others) offer next to
+/// `text/plain;charset=utf-8`; they never offer bare `text/plain`, so reading
+/// only that skipped their text entirely. `text/plain` stays as the fallback for
+/// owners that offer nothing else, which includes this backend's own writes.
+const TEXT_READ_TARGETS: [&str; 2] = ["UTF8_STRING", "text/plain"];
+
+/// Outcome of asking the selection owner for one target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetRead {
+    Data(Vec<u8>),
+    /// The owner refused the target or returned nothing for it.
+    Unavailable,
+    /// The owner never answered and xclip was killed. It will not answer the
+    /// next target either, so callers stop instead of trying one.
+    TimedOut,
+}
+
 pub struct X11Backend {
     last_text: String,
     last_image_hash: String,
@@ -29,7 +47,7 @@ impl X11Backend {
         })
     }
 
-    fn read_target(target: &str) -> Result<Option<Vec<u8>>> {
+    fn read_target(target: &str) -> Result<TargetRead> {
         let mut child = Command::new("xclip")
             .args(["-selection", "clipboard", "-o", "-t", target])
             .stdin(Stdio::null())
@@ -49,14 +67,14 @@ impl X11Backend {
             .join()
             .map_err(|_| anyhow!("xclip stdout reader panicked"))?;
         match status {
-            Some(status) if status.success() && !bytes.is_empty() => Ok(Some(bytes)),
-            Some(_) => Ok(None),
+            Some(status) if status.success() && !bytes.is_empty() => Ok(TargetRead::Data(bytes)),
+            Some(_) => Ok(TargetRead::Unavailable),
             None => {
                 log::warn!(
                     "xclip read for target {target} timed out after {}s (selection owner unresponsive), killed",
                     XCLIP_TIMEOUT.as_secs()
                 );
-                Ok(None)
+                Ok(TargetRead::TimedOut)
             }
         }
     }
@@ -96,14 +114,18 @@ impl ClipboardBackend for X11Backend {
     }
 
     fn read_snapshot(&mut self) -> Result<Option<ClipboardItem>> {
-        if let Some(bytes) = Self::read_target("image/png")? {
-            let hash = calculate_bytes_hash(&bytes);
-            if hash != self.last_image_hash {
-                self.last_image_hash = hash;
-                return Ok(Some(ClipboardItem::ImagePng(bytes)));
+        match Self::read_target("image/png")? {
+            TargetRead::Data(bytes) => {
+                let hash = calculate_bytes_hash(&bytes);
+                if hash != self.last_image_hash {
+                    self.last_image_hash = hash;
+                    return Ok(Some(ClipboardItem::ImagePng(bytes)));
+                }
             }
+            TargetRead::Unavailable => {}
+            TargetRead::TimedOut => return Ok(None),
         }
-        if let Some(bytes) = Self::read_target("text/plain")? {
+        if let Some(bytes) = read_first_text_target(Self::read_target)? {
             let text = String::from_utf8_lossy(&bytes).to_string();
             if text != self.last_text && !clipboard_text_looks_like_png_bytes(&text) {
                 self.last_text = text.clone();
@@ -119,6 +141,22 @@ impl ClipboardBackend for X11Backend {
             ClipboardItem::ImagePng(bytes) => Self::write_target("image/png", &bytes),
         }
     }
+}
+
+/// Reads the first of [`TEXT_READ_TARGETS`] the owner provides. Stops at the
+/// first data, even unchanged data, so a steady clipboard costs one read per
+/// poll, and stops at a timeout so a hung owner costs one `XCLIP_TIMEOUT`.
+fn read_first_text_target(
+    mut read: impl FnMut(&str) -> Result<TargetRead>,
+) -> Result<Option<Vec<u8>>> {
+    for target in TEXT_READ_TARGETS {
+        match read(target)? {
+            TargetRead::Data(bytes) => return Ok(Some(bytes)),
+            TargetRead::Unavailable => continue,
+            TargetRead::TimedOut => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// Waits for the child to exit, polling `try_wait`. Returns `Ok(None)` when
@@ -153,6 +191,76 @@ mod tests {
         let png_text = String::from_utf8_lossy(b"\x89PNG\r\n\x1a\n").to_string();
 
         assert!(clipboard_text_looks_like_png_bytes(&png_text));
+    }
+
+    /// Simulates a selection owner offering `offered`; records each request.
+    fn owner<'a>(
+        offered: &'a [(&'a str, TargetRead)],
+        asked: &'a mut Vec<String>,
+    ) -> impl FnMut(&str) -> Result<TargetRead> + 'a {
+        move |target| {
+            asked.push(target.to_string());
+            Ok(offered
+                .iter()
+                .find(|(t, _)| *t == target)
+                .map(|(_, read)| read.clone())
+                .unwrap_or(TargetRead::Unavailable))
+        }
+    }
+
+    #[test]
+    fn reads_utf8_string_from_owner_without_bare_text_plain() {
+        // What arboard (snip) offers: never bare text/plain.
+        let offered = [
+            ("UTF8_STRING", TargetRead::Data(b"/tmp/snip.png".to_vec())),
+            (
+                "text/plain;charset=utf-8",
+                TargetRead::Data(b"/tmp/snip.png".to_vec()),
+            ),
+        ];
+        let mut asked = Vec::new();
+
+        let text = read_first_text_target(owner(&offered, &mut asked)).unwrap();
+
+        assert_eq!(text.as_deref(), Some(&b"/tmp/snip.png"[..]));
+        assert_eq!(asked, ["UTF8_STRING"]);
+    }
+
+    #[test]
+    fn falls_back_to_text_plain_when_utf8_string_is_refused() {
+        // What `xclip -i -t text/plain` (this backend's own write) offers.
+        let offered = [("text/plain", TargetRead::Data(b"remote".to_vec()))];
+        let mut asked = Vec::new();
+
+        let text = read_first_text_target(owner(&offered, &mut asked)).unwrap();
+
+        assert_eq!(text.as_deref(), Some(&b"remote"[..]));
+        assert_eq!(asked, ["UTF8_STRING", "text/plain"]);
+    }
+
+    #[test]
+    fn stops_after_a_timeout_instead_of_waiting_again() {
+        let offered = [
+            ("UTF8_STRING", TargetRead::TimedOut),
+            ("text/plain", TargetRead::Data(b"unreachable".to_vec())),
+        ];
+        let mut asked = Vec::new();
+
+        let text = read_first_text_target(owner(&offered, &mut asked)).unwrap();
+
+        assert_eq!(text, None);
+        assert_eq!(asked, ["UTF8_STRING"]);
+    }
+
+    #[test]
+    fn no_text_when_owner_offers_none_of_the_targets() {
+        let offered = [("image/png", TargetRead::Data(b"\x89PNG".to_vec()))];
+        let mut asked = Vec::new();
+
+        let text = read_first_text_target(owner(&offered, &mut asked)).unwrap();
+
+        assert_eq!(text, None);
+        assert_eq!(asked, ["UTF8_STRING", "text/plain"]);
     }
 
     #[test]
