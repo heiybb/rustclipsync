@@ -39,7 +39,8 @@ pub async fn run_client(config: ClientConfig) -> Result<()> {
 /// can display it.
 pub async fn run_client_with_status(config: ClientConfig, status: Arc<SyncStatus>) -> Result<()> {
     log::info!(
-        "client starting: id={}, name={}, relay={}, local_poll_ms={}, max_inline_bytes={}, max_r2_bytes={}",
+        "client starting: version={}, id={}, name={}, relay={}, local_poll_ms={}, max_inline_bytes={}, max_r2_bytes={}",
+        crate::VERSION,
         config.client_id,
         config.client_name,
         config.server_url,
