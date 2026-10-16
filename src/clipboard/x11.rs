@@ -15,9 +15,14 @@ const XCLIP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Text targets to read, best first. `UTF8_STRING` is what xclip asks for when
 /// no `-t` is given, and what arboard-based apps (snip and others) offer next to
 /// `text/plain;charset=utf-8`; they never offer bare `text/plain`, so reading
-/// only that skipped their text entirely. `text/plain` stays as the fallback for
-/// owners that offer nothing else, which includes this backend's own writes.
-const TEXT_READ_TARGETS: [&str; 2] = ["UTF8_STRING", "text/plain"];
+/// only that skipped their text entirely.
+///
+/// Bare `text/plain` goes last because GTK serves it as ASCII: every non-ASCII
+/// character comes back as a literal backslash-u escape, so Chinese copied from
+/// a GTK app arrives as a run of `\u` plus four hex digits. It stays as the
+/// fallback for owners that offer nothing else, which includes this backend's
+/// own writes.
+const TEXT_READ_TARGETS: [&str; 3] = ["UTF8_STRING", "text/plain;charset=utf-8", "text/plain"];
 
 /// Outcome of asking the selection owner for one target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,7 +240,32 @@ mod tests {
         let text = read_first_text_target(owner(&offered, &mut asked)).unwrap();
 
         assert_eq!(text.as_deref(), Some(&b"remote"[..]));
-        assert_eq!(asked, ["UTF8_STRING", "text/plain"]);
+        assert_eq!(
+            asked,
+            ["UTF8_STRING", "text/plain;charset=utf-8", "text/plain"]
+        );
+    }
+
+    #[test]
+    fn prefers_utf8_text_plain_over_gtk_ascii_text_plain() {
+        // What a GTK owner returns when UTF8_STRING is not served: bare
+        // text/plain is ASCII with \u escapes, the charset variant is intact.
+        let offered = [
+            (
+                "text/plain;charset=utf-8",
+                TargetRead::Data("马上".as_bytes().to_vec()),
+            ),
+            (
+                "text/plain",
+                TargetRead::Data(b"\x5cu9a6c\x5cu4e0a".to_vec()),
+            ),
+        ];
+        let mut asked = Vec::new();
+
+        let text = read_first_text_target(owner(&offered, &mut asked)).unwrap();
+
+        assert_eq!(text.as_deref(), Some("马上".as_bytes()));
+        assert_eq!(asked, ["UTF8_STRING", "text/plain;charset=utf-8"]);
     }
 
     #[test]
@@ -260,7 +290,10 @@ mod tests {
         let text = read_first_text_target(owner(&offered, &mut asked)).unwrap();
 
         assert_eq!(text, None);
-        assert_eq!(asked, ["UTF8_STRING", "text/plain"]);
+        assert_eq!(
+            asked,
+            ["UTF8_STRING", "text/plain;charset=utf-8", "text/plain"]
+        );
     }
 
     #[test]
